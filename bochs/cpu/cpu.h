@@ -1258,6 +1258,12 @@ public: // for now...
 
 #if BX_SUPPORT_HANDLERS_CHAINING_SPEEDUPS
   const volatile Bit8u *cpuloop_stack_anchor = NULL;
+#if BX_WASM_ITERATIVE_TRACE_LINKING
+  // Wasm-safe iterative trace linking: instead of recursive
+  // BX_EXECUTE_INSTRUCTION calls that overflow Wasm's bounded stack,
+  // the branch handler sets this pointer and returns to the main loop.
+  bxInstruction_c *next_linked_trace = NULL;
+#endif
 #endif
 
   // Boundaries of current code page, based on EIP
@@ -5905,10 +5911,20 @@ class bxInstruction_c;
 #define linkTrace(i)
 #endif
 
+#if BX_WASM_ITERATIVE_TRACE_LINKING
+// Wasm iterative version: linkTrace sets next_linked_trace and returns.
+// The main cpu_loop picks it up on the next iteration — no recursion.
+#define BX_LINK_TRACE(i) {                             \
+  BX_COMMIT_INSTRUCTION(i);                            \
+  linkTrace(i);                                        \
+  return;                                              \
+}
+#else
 #define BX_LINK_TRACE(i) {                             \
   BX_COMMIT_INSTRUCTION(i);                            \
   return linkTrace(i);                                 \
 }
+#endif
 
 #define BX_NEXT_INSTR(i) {                             \
   BX_COMMIT_INSTRUCTION(i);                            \

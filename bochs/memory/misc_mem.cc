@@ -80,6 +80,10 @@ void BX_MEM_C::init_memory(Bit64u guest, Bit64u host, Bit32u block_size)
     BX_MEM_THIS memory_type[i][1] = false;
   }
 
+#if BX_WASM_DIRECT_RAM_FASTPATH
+  init_handler_bitmap();
+#endif
+
   BX_MEM_THIS register_state();
 }
 
@@ -729,6 +733,23 @@ Bit8u *BX_MEM_C::getHostMemAddr(BX_CPU_C *cpu, bx_phy_address addr, unsigned rw)
 {
   bx_phy_address a20addr = A20ADDR(addr);
 
+#if BX_WASM_DIRECT_RAM_FASTPATH
+  // Fast path: for addresses in normal RAM range with no handlers,
+  // return the direct pointer immediately without traversing the
+  // handler linked list. This is the hottest path — called on every
+  // TLB miss and instruction fetch.
+  {
+    Bit8u *direct = wasm_ram_fastpath(a20addr, rw);
+    if (BX_LIKELY(direct != NULL)) {
+#if BX_SUPPORT_MONITOR_MWAIT
+      if ((rw & 1) && BX_MEM_THIS is_monitor(a20addr & ~((bx_phy_address)(0xfff)), 0xfff))
+        return NULL; // Vetoed — write to monitored page
+#endif
+      return direct;
+    }
+  }
+#endif // BX_WASM_DIRECT_RAM_FASTPATH
+
   // Translate guest physical address to linear memory offset (handles PCI hole)
   bx_phy_address linear_addr = bx_translate_gpa_to_linear(a20addr);
 
@@ -901,6 +922,9 @@ BX_MEM_C::registerMemoryHandlers(void *param, memory_handler_t read_handler,
     memory_handler->end = end_addr;
     memory_handler->bitmap = bitmap;
     memory_handler->overlap = overlap;
+#if BX_WASM_DIRECT_RAM_FASTPATH
+    update_handler_bitmap(page_idx, true);
+#endif
     if ((begin_addr >= 0xc0000) && (end_addr < 0xe0000)) {
       bx_pc_system.MemoryMappingChanged();
     }
@@ -945,6 +969,12 @@ bool BX_MEM_C::unregisterMemoryHandlers(void *param, bx_phy_address begin_addr, 
     else
       BX_MEM_THIS memory_handlers[page_idx] = memory_handler->next;
     delete memory_handler;
+#if BX_WASM_DIRECT_RAM_FASTPATH
+    // Clear bitmap bit if no more handlers for this 1MB region
+    if (BX_MEM_THIS memory_handlers[page_idx] == NULL) {
+      update_handler_bitmap(page_idx, false);
+    }
+#endif
     if ((begin_addr >= 0xc0000) && (end_addr < 0xe0000)) {
       bx_pc_system.MemoryMappingChanged();
     }
@@ -993,6 +1023,43 @@ void BX_MEM_C::set_bios_rom_access(Bit8u region, bool enabled)
     BX_MEM_THIS bios_rom_access &= ~region;
   }
 }
+
+#if BX_WASM_DIRECT_RAM_FASTPATH
+
+void BX_MEM_C::init_handler_bitmap(void)
+{
+  // Allocate one bit per 1MB region, packed into Bit32u words.
+  // For a 4GB physical address space, that's 4096 MB = 128 Bit32u words.
+  // For BX_PHY_ADDRESS_LONG (>32-bit physical), scale accordingly.
+  Bit32u total_mb = (Bit32u)(BX_CONST64(1) << (BX_PHY_ADDRESS_WIDTH - 20));
+  BX_MEM_THIS handler_bitmap_size = (total_mb + 31) / 32;
+  BX_MEM_THIS handler_bitmap = new Bit32u[BX_MEM_THIS handler_bitmap_size];
+  for (Bit32u i = 0; i < BX_MEM_THIS handler_bitmap_size; i++)
+    BX_MEM_THIS handler_bitmap[i] = 0;
+
+  // The contiguous RAM pointer is the aligned vector base.
+  // For non-LARGE_RAMFILE builds, all blocks are contiguous starting at vector.
+  BX_MEM_THIS ram_direct_ptr = BX_MEM_THIS vector;
+  BX_MEM_THIS ram_direct_len = BX_MEM_THIS len;
+
+  BX_INFO(("Wasm direct RAM fast path initialized: RAM base=%p, size=" FMT_LL "d MB, bitmap=%d words",
+           BX_MEM_THIS ram_direct_ptr, BX_MEM_THIS ram_direct_len >> 20,
+           BX_MEM_THIS handler_bitmap_size));
+}
+
+void BX_MEM_C::update_handler_bitmap(Bit32u page_idx, bool has_handler)
+{
+  Bit32u word = page_idx >> 5;
+  Bit32u bit  = page_idx & 31;
+  if (word < BX_MEM_THIS handler_bitmap_size) {
+    if (has_handler)
+      BX_MEM_THIS handler_bitmap[word] |= (1u << bit);
+    else
+      BX_MEM_THIS handler_bitmap[word] &= ~(1u << bit);
+  }
+}
+
+#endif // BX_WASM_DIRECT_RAM_FASTPATH
 
 Bit8u BX_MEM_C::flash_read(Bit32u addr)
 {

@@ -447,3 +447,85 @@ should be done immediately as a baseline improvement.
 Optimization #4 is the most invasive but targets a fundamental bottleneck
 in the memory subsystem. It would benefit from profiling data to confirm
 the expected gains before investing in implementation.
+
+---
+
+## Implementation Status
+
+All five optimizations have been implemented:
+
+| # | Optimization | Files Changed |
+|---|---|---|
+| 1 | Asyncify onlylist | `wasm/asyncify-onlylist.txt` (new) |
+| 2 | Iterative trace linking | `cpu/cpu.cc`, `cpu/cpu.h`, `config.h.in` |
+| 3 | Stripped configure | `wasm/configure-wasm-optimized.sh` (new) |
+| 4 | Direct RAM fast path | `memory/memory.cc`, `memory/memory-bochs.h`, `memory/misc_mem.cc`, `config.h.in` |
+| 5 | Deep Wizer snapshots | `wasm/wizer-deep-snapshot.sh` (new) |
+
+### New config.h.in defines:
+- `BX_WASM_ITERATIVE_TRACE_LINKING` — iterative (non-recursive) trace linking
+- `BX_WASM_DIRECT_RAM_FASTPATH` — direct RAM access bypassing handler chain
+
+Both default to 0; `wasm/configure-wasm-optimized.sh` enables them automatically.
+
+---
+
+## Strategic Architecture Analysis: Beyond Bochs
+
+### Current Asyncify Status
+
+Container2wasm currently uses only `--pass-arg=asyncify-ignore-imports` which
+merely skips imported (WASI) functions but **still instruments every internal
+Bochs function call**. The `asyncify-onlylist` in this patch restricts
+instrumentation to ~60 functions (the I/O suspension paths) instead of ~5000+.
+
+### Fastest Container-in-Wasm Architecture (No Constraints)
+
+| Tier | Approach | Speed | Tradeoff |
+|------|----------|-------|----------|
+| 1 | **Userspace emulation** (libriscv + Linux syscall layer) | Fastest | Requires RISC-V cross-compilation, syscall emulation work |
+| 2 | **QEMU with TCG→Wasm JIT** (qemu-wasm, browser only) | Fast | Browser-only, no WASI support |
+| 3 | **QEMU TCI under WASI** | Medium | No JIT in WASI (no dynamic codegen) |
+| 4 | **Bochs with these optimizations** | Slow (but improved) | Pure interpretation, universal compatibility |
+
+### The libriscv Opportunity
+
+[libriscv](https://github.com/libriscv/libriscv) is a ~20K LOC RISC-V
+userspace emulator achieving 92% native CoreMark with its libtcc JIT. The
+key insight: it's the **open-source CheerpX model** applied to RISC-V:
+
+- **CheerpX** (proprietary) = x86 JIT + Linux syscall emulation → no kernel
+- **libriscv + syscall layer** (open source) = RISC-V interpreter + Linux
+  syscall emulation → no kernel
+
+This skips the entire kernel boot, virtio stack, and full system emulation
+overhead. For the container2wasm use case:
+
+1. Cross-compile container to RISC-V (`docker buildx --platform linux/riscv64`)
+2. Compile libriscv to Wasm (clean C++, straightforward with WASI SDK)
+3. Build Linux syscall emulation layer (~100-200 syscalls, mapped to WASI)
+4. Load container ELF binary directly — no kernel, no boot, instant start
+
+### To Beat WebVM/CheerpX
+
+WebVM uses CheerpX's proprietary x86→Wasm JIT. Don't compete on the same
+axis. Instead:
+
+1. **Use RISC-V** — simpler ISA, faster to interpret than x86 (no legacy
+   modes, fixed-width encoding, clean register file)
+2. **AOT at build time** — libriscv's binary translation can pre-compile
+   hot RISC-V code to native Wasm at container build time, not runtime
+3. **Skip the kernel** — CheerpX's real advantage is no kernel, not the JIT
+
+### WASI vs Browser (Emscripten)
+
+| | WASI | Emscripten (Browser) |
+|---|---|---|
+| Threading | Single-threaded | Multi-threaded (Web Workers) |
+| JIT | Impossible (no dynamic codegen) | QEMU TCG→Wasm JIT works |
+| Runtime | wasmtime, wazero, wasmer | Chrome, Firefox, Safari |
+| Startup | Fast (Wizer snapshots) | Slower (download + instantiate) |
+| Best emulator | Bochs (optimized) or libriscv | QEMU-wasm (JIT) |
+
+For maximum performance with no constraints: **QEMU-wasm in browsers** and
+**libriscv (userspace) under WASI** is the optimal split.

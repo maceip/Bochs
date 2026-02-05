@@ -166,6 +166,39 @@ private:
   bool smram_enable;
   bool smram_restricted;
 
+#if BX_WASM_DIRECT_RAM_FASTPATH
+  // Direct RAM fast path for Wasm targets.
+  // Per-megabyte bitmap: bit set = handlers registered for that MB region.
+  // Allows O(1) check instead of pointer dereference + NULL test.
+  Bit32u *handler_bitmap;        // one bit per 1MB region (bitmap of 32-region groups)
+  Bit32u handler_bitmap_size;    // number of Bit32u entries
+  Bit8u  *ram_direct_ptr;        // contiguous RAM base pointer (== vector)
+  bx_phy_address ram_direct_len; // total RAM size for bounds check
+
+  BX_MEM_SMF void    update_handler_bitmap(Bit32u page_idx, bool has_handler);
+  BX_MEM_SMF void    init_handler_bitmap(void);
+public:
+  // Inline fast path: returns direct pointer for RAM addresses with no
+  // registered handlers. Returns NULL if address needs slow path (MMIO,
+  // BIOS, legacy region, or has registered handlers).
+  BX_MEM_SMF BX_CPP_INLINE Bit8u* wasm_ram_fastpath(bx_phy_address a20addr, unsigned rw)
+  {
+    // Quick bounds check: must be in normal RAM range (above legacy, below limit)
+    if (BX_LIKELY(a20addr >= 0x00100000 && a20addr < ram_direct_len)) {
+      // Check handler bitmap: one bit per 1MB region
+      Bit32u mb_idx = (Bit32u)(a20addr >> 20);
+      Bit32u word = mb_idx >> 5;
+      Bit32u bit  = mb_idx & 31;
+      if (BX_LIKELY(word < handler_bitmap_size && !(handler_bitmap[word] & (1u << bit)))) {
+        // No handlers for this 1MB region — direct RAM access
+        return ram_direct_ptr + a20addr;
+      }
+    }
+    return NULL; // fall through to slow path
+  }
+private:
+#endif
+
   bool    rom_present[65];
   bool    memory_type[13][2];
   Bit32u  bios_rom_addr;
