@@ -326,8 +326,6 @@ inline void sys_accept(Machine& m) {
     int sockfd = m.template sysarg<int>(0);
     uint64_t addr_ptr = m.template sysarg<uint64_t>(1);
     uint64_t addrlen_ptr = m.template sysarg<uint64_t>(2);
-    (void)addr_ptr;
-    (void)addrlen_ptr;
 
     auto* sock = get_network_ctx().get_socket(sockfd);
     if (!sock) {
@@ -340,9 +338,75 @@ inline void sys_accept(Machine& m) {
         return;
     }
 
-    // In async mode, this would block/return EAGAIN
-    // For now, stub as not implemented
-    m.set_result(err::NOSYS);
+#ifdef __EMSCRIPTEN__
+    // In browser mode, accept is async via WebSocket
+    // The JS bridge handles incoming connections
+    int result = EM_ASM_INT({
+        if (typeof Module.onSocketAccept === 'function') {
+            return Module.onSocketAccept($0);
+        }
+        return -11;  // EAGAIN
+    }, sockfd);
+
+    if (result > 0) {
+        // New connection fd returned from JS
+        // Create a new socket for it
+        int client_fd = get_network_ctx().create_socket(sock->domain, sock->type, 0);
+        auto* client_sock = get_network_ctx().get_socket(client_fd);
+        if (client_sock) {
+            client_sock->connected = true;
+        }
+
+        // Fill in peer address if requested
+        if (addr_ptr && addrlen_ptr) {
+            sockaddr_in client_addr = {};
+            client_addr.sin_family = af::INET;
+            client_addr.sin_port = 0;
+            client_addr.sin_addr = 0x0100007f;  // 127.0.0.1
+
+            int32_t len = sizeof(client_addr);
+            m.memory.memcpy(addr_ptr, &client_addr, sizeof(client_addr));
+            m.memory.memcpy(addrlen_ptr, &len, sizeof(len));
+        }
+
+        m.set_result(client_fd);
+    } else {
+        m.set_result(result);
+    }
+#else
+    // Native: use real accept
+    struct ::sockaddr_in client_addr;
+    socklen_t addrlen = sizeof(client_addr);
+
+    int native_client = ::accept(sock->native_fd, (struct sockaddr*)&client_addr, &addrlen);
+    if (native_client < 0) {
+        m.set_result(-errno);
+        return;
+    }
+
+    // Create virtual socket for the connection
+    int client_fd = get_network_ctx().create_socket(sock->domain, sock->type, 0);
+    auto* client_sock = get_network_ctx().get_socket(client_fd);
+    if (client_sock) {
+        client_sock->connected = true;
+        client_sock->native_fd = native_client;
+    }
+
+    // Fill in peer address if requested
+    if (addr_ptr && addrlen_ptr) {
+        sockaddr_in guest_addr;
+        memset(&guest_addr, 0, sizeof(guest_addr));
+        guest_addr.sin_family = af::INET;
+        guest_addr.sin_port = client_addr.sin_port;
+        guest_addr.sin_addr = client_addr.sin_addr.s_addr;
+
+        int32_t len = sizeof(guest_addr);
+        m.memory.memcpy(addr_ptr, &guest_addr, sizeof(guest_addr));
+        m.memory.memcpy(addrlen_ptr, &len, sizeof(len));
+    }
+
+    m.set_result(client_fd);
+#endif
 }
 
 // syscall 203: connect(sockfd, addr, addrlen)

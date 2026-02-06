@@ -10,6 +10,11 @@
 #include <cstring>
 #include <random>
 #include <iostream>
+#include <unordered_map>
+
+#ifndef __EMSCRIPTEN__
+#include <poll.h>
+#endif
 
 namespace syscalls {
 
@@ -18,6 +23,10 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 // RISC-V 64-bit syscall numbers (from Linux kernel)
 namespace nr {
     constexpr int getcwd        = 17;
+    constexpr int eventfd2      = 19;
+    constexpr int epoll_create1 = 20;
+    constexpr int epoll_ctl     = 21;
+    constexpr int epoll_pwait   = 22;
     constexpr int dup           = 23;
     constexpr int dup3          = 24;
     constexpr int fcntl         = 25;
@@ -50,6 +59,7 @@ namespace nr {
     constexpr int clock_gettime = 113;
     constexpr int sigaction     = 134;
     constexpr int sigprocmask   = 135;
+    constexpr int uname         = 160;
     constexpr int getpid        = 172;
     constexpr int getppid       = 173;
     constexpr int getuid        = 174;
@@ -484,7 +494,253 @@ static void sys_fcntl(Machine& m) {
 
 static void sys_dup(Machine& m) { m.set_result(err::NOSYS); }
 static void sys_dup3(Machine& m) { m.set_result(err::NOSYS); }
-static void sys_pipe2(Machine& m) { m.set_result(err::NOSYS); }
+
+// =============================================================================
+// Pipe support (needed by libuv for internal signaling)
+// =============================================================================
+
+// Simple pipe state - just tracks pipe pairs
+struct PipeState {
+    static constexpr int PIPE_FD_BASE = 500;
+    int next_fd = PIPE_FD_BASE;
+    std::unordered_map<int, std::vector<uint8_t>> buffers;  // fd -> data
+    std::unordered_map<int, int> read_to_write;  // read_fd -> write_fd
+    std::unordered_map<int, int> write_to_read;  // write_fd -> read_fd
+};
+
+inline PipeState& get_pipe_state() {
+    static PipeState state;
+    return state;
+}
+
+static void sys_pipe2(Machine& m) {
+    auto pipefd_addr = m.sysarg(0);
+    int flags = m.template sysarg<int>(1);
+    (void)flags;
+
+    auto& ps = get_pipe_state();
+    int read_fd = ps.next_fd++;
+    int write_fd = ps.next_fd++;
+
+    ps.buffers[read_fd] = {};
+    ps.read_to_write[read_fd] = write_fd;
+    ps.write_to_read[write_fd] = read_fd;
+
+    // Write fds to guest memory: pipefd[0] = read, pipefd[1] = write
+    m.memory.template write<int32_t>(pipefd_addr, read_fd);
+    m.memory.template write<int32_t>(pipefd_addr + 4, write_fd);
+
+    m.set_result(0);
+}
+
+// =============================================================================
+// Eventfd support (used by libuv for wakeup)
+// =============================================================================
+
+struct EventfdState {
+    static constexpr int EVENTFD_FD_BASE = 700;
+    int next_fd = EVENTFD_FD_BASE;
+    std::unordered_map<int, uint64_t> counters;
+};
+
+inline EventfdState& get_eventfd_state() {
+    static EventfdState state;
+    return state;
+}
+
+// =============================================================================
+// Epoll support (critical for Node.js/libuv event loop)
+// =============================================================================
+
+// epoll_event structure (matches Linux)
+struct linux_epoll_event {
+    uint32_t events;
+    uint64_t data;
+} __attribute__((packed));
+
+// Epoll constants
+constexpr uint32_t EPOLLIN     = 0x001;
+constexpr uint32_t EPOLLOUT    = 0x004;
+constexpr uint32_t EPOLLERR    = 0x008;
+constexpr uint32_t EPOLLHUP    = 0x010;
+constexpr uint32_t EPOLLET     = 1u << 31;
+
+constexpr int EPOLL_CTL_ADD = 1;
+constexpr int EPOLL_CTL_DEL = 2;
+constexpr int EPOLL_CTL_MOD = 3;
+
+// Epoll instance state
+struct EpollInstance {
+    int fd;
+    struct WatchedFd {
+        uint32_t events;
+        uint64_t data;
+    };
+    std::unordered_map<int, WatchedFd> watched;
+};
+
+struct EpollState {
+    static constexpr int EPOLL_FD_BASE = 800;
+    int next_fd = EPOLL_FD_BASE;
+    std::unordered_map<int, EpollInstance> instances;
+};
+
+inline EpollState& get_epoll_state() {
+    static EpollState state;
+    return state;
+}
+
+// syscall 20: epoll_create1(flags)
+static void sys_epoll_create1(Machine& m) {
+    int flags = m.template sysarg<int>(0);
+    (void)flags;
+
+    auto& es = get_epoll_state();
+    int fd = es.next_fd++;
+
+    EpollInstance inst;
+    inst.fd = fd;
+    es.instances[fd] = std::move(inst);
+
+    m.set_result(fd);
+}
+
+// syscall 21: epoll_ctl(epfd, op, fd, event)
+static void sys_epoll_ctl(Machine& m) {
+    int epfd = m.template sysarg<int>(0);
+    int op = m.template sysarg<int>(1);
+    int fd = m.template sysarg<int>(2);
+    uint64_t event_addr = m.sysarg(3);
+
+    auto& es = get_epoll_state();
+    auto it = es.instances.find(epfd);
+    if (it == es.instances.end()) {
+        m.set_result(err::BADF);
+        return;
+    }
+
+    auto& inst = it->second;
+
+    switch (op) {
+        case EPOLL_CTL_ADD:
+        case EPOLL_CTL_MOD: {
+            linux_epoll_event ev;
+            m.memory.memcpy_out(&ev, event_addr, sizeof(ev));
+            inst.watched[fd] = { ev.events, ev.data };
+            m.set_result(0);
+            break;
+        }
+        case EPOLL_CTL_DEL:
+            inst.watched.erase(fd);
+            m.set_result(0);
+            break;
+        default:
+            m.set_result(err::INVAL);
+    }
+}
+
+// syscall 22: epoll_pwait(epfd, events, maxevents, timeout, sigmask)
+// Note: Socket integration is done in network.hpp via epoll_check_sockets()
+static void sys_epoll_pwait(Machine& m) {
+    int epfd = m.template sysarg<int>(0);
+    uint64_t events_addr = m.sysarg(1);
+    int maxevents = m.template sysarg<int>(2);
+    int timeout = m.template sysarg<int>(3);
+    (void)timeout;
+
+    auto& es = get_epoll_state();
+    auto it = es.instances.find(epfd);
+    if (it == es.instances.end()) {
+        m.set_result(err::BADF);
+        return;
+    }
+
+    auto& inst = it->second;
+    int ready_count = 0;
+    uint64_t write_ptr = events_addr;
+
+    // Check pipes and eventfds
+    for (auto& [fd, watched] : inst.watched) {
+        if (ready_count >= maxevents) break;
+
+        uint32_t ready_events = 0;
+
+        // Check pipes
+        auto& ps = get_pipe_state();
+        auto buf_it = ps.buffers.find(fd);
+        if (buf_it != ps.buffers.end() && !buf_it->second.empty()) {
+            if (watched.events & EPOLLIN) {
+                ready_events |= EPOLLIN;
+            }
+        }
+
+        // Write side of pipes: always writable
+        if (ps.write_to_read.count(fd) && (watched.events & EPOLLOUT)) {
+            ready_events |= EPOLLOUT;
+        }
+
+        // Check eventfds
+        auto& efs = get_eventfd_state();
+        auto efd_it = efs.counters.find(fd);
+        if (efd_it != efs.counters.end() && efd_it->second > 0) {
+            if (watched.events & EPOLLIN) {
+                ready_events |= EPOLLIN;
+            }
+        }
+
+        if (ready_events) {
+            linux_epoll_event out_ev;
+            out_ev.events = ready_events;
+            out_ev.data = watched.data;
+            m.memory.memcpy(write_ptr, &out_ev, sizeof(out_ev));
+            write_ptr += sizeof(out_ev);
+            ready_count++;
+        }
+    }
+
+    m.set_result(ready_count);
+}
+
+// syscall 19: eventfd2(initval, flags)
+static void sys_eventfd2(Machine& m) {
+    unsigned int initval = m.template sysarg<unsigned int>(0);
+    int flags = m.template sysarg<int>(1);
+    (void)flags;
+
+    auto& efs = get_eventfd_state();
+    int fd = efs.next_fd++;
+    efs.counters[fd] = initval;
+
+    m.set_result(fd);
+}
+
+// =============================================================================
+// Uname (platform info - needed by Node.js)
+// =============================================================================
+
+struct linux_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+static void sys_uname(Machine& m) {
+    uint64_t buf_addr = m.sysarg(0);
+
+    linux_utsname uts = {};
+    strncpy(uts.sysname, "Linux", 64);
+    strncpy(uts.nodename, "friscy", 64);
+    strncpy(uts.release, "6.1.0-friscy", 64);
+    strncpy(uts.version, "#1 SMP", 64);
+    strncpy(uts.machine, "riscv64", 64);
+    strncpy(uts.domainname, "(none)", 64);
+
+    m.memory.memcpy(buf_addr, &uts, sizeof(uts));
+    m.set_result(0);
+}
 
 }  // namespace handlers
 
@@ -534,6 +790,15 @@ inline void install_syscalls(Machine& machine, vfs::VirtualFS& fs) {
     machine.install_syscall_handler(nr::dup, sys_dup);
     machine.install_syscall_handler(nr::dup3, sys_dup3);
     machine.install_syscall_handler(nr::pipe2, sys_pipe2);
+
+    // Event loop syscalls (critical for Node.js/libuv)
+    machine.install_syscall_handler(nr::epoll_create1, sys_epoll_create1);
+    machine.install_syscall_handler(nr::epoll_ctl, sys_epoll_ctl);
+    machine.install_syscall_handler(nr::epoll_pwait, sys_epoll_pwait);
+    machine.install_syscall_handler(nr::eventfd2, sys_eventfd2);
+
+    // Platform info
+    machine.install_syscall_handler(nr::uname, sys_uname);
 }
 
 }  // namespace syscalls
