@@ -12,7 +12,7 @@ This is the **CheerpX model**: userland-only emulation, no kernel boot.
 
 ---
 
-## Current Status (February 2025)
+## Current Status (February 2026)
 
 | Layer | Status | Notes |
 |-------|--------|-------|
@@ -21,13 +21,20 @@ This is the **CheerpX model**: userland-only emulation, no kernel boot.
 | VFS (tar-backed) | ✅ Complete | Read-only, symlinks work |
 | Dynamic Linker | ✅ Complete | ld-musl, aux vector |
 | Networking | ✅ Complete | TCP/UDP via WebSocket proxy |
-| AOT Compiler (rv2wasm) | 🟡 70% | Disasm done, translation partial |
+| AOT Compiler (rv2wasm) | 🟡 85% | br_table dispatch done, tests passing |
 | Wizer Snapshots | ⬜ Not started | For instant startup |
 
+**Recent Progress** (Feb 2026):
+- ✅ rv2wasm builds and compiles real RISC-V binaries to valid Wasm
+- ✅ br_table O(1) dispatch implemented in `wasm_builder.rs`
+- ✅ 12 integration tests passing (static + dynamic/PIE binaries)
+- ✅ wasm-encoder 0.201 API compatibility fixed
+- ✅ Dynamic ELF/PIE detection and aux vector prerequisites verified
+
 **Next 3 Action Items**:
-1. **Test rv2wasm** - Build with `cargo build`, run on simple RISC-V ELF
-2. **Test dynamic linking** - Run Alpine busybox via `./friscy --rootfs alpine.tar /bin/busybox ls`
-3. **Complete rv2wasm dispatch** - Implement br_table in `wasm_builder.rs`
+1. **Floating-point translation** - Implement F/D extension in `translate.rs`
+2. **Atomics translation** - Implement LR/SC/AMO in `translate.rs`
+3. **Integrate rv2wasm with friscy-pack** - Add `--aot` flag
 
 ---
 
@@ -323,20 +330,25 @@ friscy/
 │
 ├── rv2wasm/                # [~] RISC-V → Wasm AOT compiler (Rust)
 │   ├── Cargo.toml          #     Dependencies: goblin, wasm-encoder, clap
+│   ├── Cargo.lock          #     Locked dependency versions
+│   ├── tests/
+│   │   └── integration_test.rs  # [✓] 12 end-to-end tests (wasmparser validated)
 │   └── src/
 │       ├── main.rs         # [✓] CLI entry point
 │       ├── lib.rs          # [✓] Library interface + compile() function
-│       ├── elf.rs          # [✓] ELF parsing (goblin)
+│       ├── elf.rs          # [✓] ELF parsing (goblin), PIE/dynamic detection
 │       ├── disasm.rs       # [✓] RISC-V disassembler (RV64GC, 80+ opcodes)
 │       ├── cfg.rs          # [✓] Control flow graph construction
 │       ├── translate.rs    # [~] RISC-V → Wasm translation (core ops done)
-│       └── wasm_builder.rs # [~] Wasm module emission (wasm-encoder)
+│       └── wasm_builder.rs # [✓] Wasm module emission + br_table dispatch
 │
 ├── host_proxy/             # Host-side network proxy
 │   ├── main.go             # WebSocket → real TCP/UDP
 │   └── go.mod
 │
 ├── tests/
+│   ├── test_simple.c       # [✓] Static RISC-V test (raw syscalls, no libc)
+│   ├── test_dynamic.c      # [✓] Dynamic/PIE RISC-V test (libc, printf)
 │   ├── test_http_minimal.c # HTTP networking test
 │   ├── test_server.py      # Test HTTP server
 │   └── run_network_test.sh

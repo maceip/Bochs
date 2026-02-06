@@ -3,21 +3,22 @@
 Ahead-of-time compiler that translates RISC-V RV64GC binaries to WebAssembly
 for 5-20x speedup over interpreted execution.
 
-## Status: Work in Progress
+## Status: Core Pipeline Complete
 
 ### Implemented
-- [x] ELF parsing (goblin crate)
+- [x] ELF parsing (goblin crate) - static and dynamic/PIE binaries
 - [x] RISC-V disassembler (80+ opcodes: RV64IMAFDC)
 - [x] Control flow graph construction
 - [x] Basic block identification
 - [x] RISC-V → Wasm IR translation (core integer ops)
-- [x] Wasm binary generation (wasm-encoder)
+- [x] Wasm binary generation (wasm-encoder 0.201)
+- [x] O(1) br_table dispatch (PC→index mapping table)
+- [x] DataSection for dispatch mapping table
+- [x] 12 integration tests (wasmparser validated)
 
-### In Progress
-- [ ] Dispatch loop optimization (br_table)
-- [ ] Floating-point instruction translation
-- [ ] Atomics instruction translation
-- [ ] End-to-end testing
+### Remaining
+- [ ] Floating-point instruction translation (F/D extensions)
+- [ ] Atomics instruction translation (LR/SC/AMO)
 
 ### Future
 - [ ] Integration with friscy-pack `--aot` flag
@@ -44,6 +45,23 @@ rv2wasm input.elf -o output.wasm --debug --verbose
 rv2wasm --rootfs alpine.tar --entry /bin/busybox -o busybox.wasm
 ```
 
+## Testing
+
+```bash
+# Install cross-compiler
+apt-get install gcc-riscv64-linux-gnu
+
+# Build test binaries
+riscv64-linux-gnu-gcc -static -nostdlib -o ../tests/test_simple.elf ../tests/test_simple.c
+riscv64-linux-gnu-gcc -o ../tests/test_dynamic.elf ../tests/test_dynamic.c
+
+# Run all 12 integration tests
+cargo test
+
+# Tests cover: ELF parsing, disassembly, CFG construction, Wasm validation,
+# br_table dispatch, data sections, debug mode, static + dynamic/PIE binaries
+```
+
 ## Architecture
 
 ```
@@ -54,8 +72,9 @@ RISC-V ELF  →  ELF Parser  →  Disassembler  →  CFG Builder  →  Translato
 ### Memory Layout
 
 The generated Wasm uses:
-- First 256 bytes: Register file (x0-x31, each 8 bytes)
-- Rest: Guest RAM
+- `0x000-0x0FF`: Register file (x0-x31, each 8 bytes = 256 bytes)
+- `0x100+`: Dispatch mapping table (PC→block index, one byte per 2-byte slot)
+- After table: Guest RAM
 
 ### Function Signature
 
@@ -68,6 +87,15 @@ Each basic block compiles to:
   ;;   0x80000000 | pc = syscall at pc
 )
 ```
+
+### Dispatch (br_table)
+
+The dispatch function uses O(1) indexed dispatch:
+1. Reads PC from the register file
+2. Computes index: `memory[(DISPATCH_MAP_OFFSET + (pc - min_addr) / 2)]`
+3. Uses `br_table` to jump to the correct case block
+4. Each case calls the corresponding block function and loops back
+5. Function indices: 0=syscall import, 1=dispatch, 2+=block functions
 
 ### Syscall Handling
 

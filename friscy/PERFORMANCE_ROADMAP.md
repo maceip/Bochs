@@ -28,7 +28,7 @@
 | Dynamic Linker | ✅ Complete | N/A | `elf_loader.hpp`, `main.cpp` |
 | Networking | ✅ Complete | N/A | `network.hpp`, `host_proxy/` |
 | friscy-pack CLI | ✅ Complete | N/A | `friscy-pack` |
-| **rv2wasm AOT** | 🟡 70% Done | 5-20x speedup | `rv2wasm/src/` |
+| **rv2wasm AOT** | 🟡 85% Done | 5-20x speedup | `rv2wasm/src/` |
 | Wizer Snapshots | ⬜ Not Started | 2-5x startup | N/A |
 | Browser Terminal | 🟡 Partial | N/A | `network_bridge.js` |
 
@@ -86,36 +86,32 @@ The rv2wasm compiler translates RISC-V binaries to native WebAssembly at build t
 | Component | Status | File | Notes |
 |-----------|--------|------|-------|
 | CLI Interface | ✅ Done | `rv2wasm/src/main.rs` | Parses args, orchestrates pipeline |
-| ELF Parsing | ✅ Done | `rv2wasm/src/elf.rs` | Uses `goblin` crate |
+| ELF Parsing | ✅ Done | `rv2wasm/src/elf.rs` | goblin, PIE/dynamic detection |
 | Disassembler | ✅ Done | `rv2wasm/src/disasm.rs` | 80+ RV64GC opcodes |
 | CFG Builder | ✅ Done | `rv2wasm/src/cfg.rs` | Basic blocks, functions |
 | Wasm IR | ✅ Done | `rv2wasm/src/translate.rs` | Core integer ops |
-| Wasm Output | ✅ Done | `rv2wasm/src/wasm_builder.rs` | Uses `wasm-encoder` |
-| Dispatch Loop | 🟡 Basic | `rv2wasm/src/wasm_builder.rs:90` | Needs br_table |
+| Wasm Output | ✅ Done | `rv2wasm/src/wasm_builder.rs` | wasm-encoder 0.201 |
+| Dispatch Loop | ✅ Done | `rv2wasm/src/wasm_builder.rs` | O(1) br_table dispatch |
+| Integration Tests | ✅ Done | `rv2wasm/tests/integration_test.rs` | 12 tests, wasmparser validated |
 | Float Ops | ⬜ Stubs | `rv2wasm/src/disasm.rs:90` | FLW/FSW/FADD etc |
 | Atomics | ⬜ Stubs | `rv2wasm/src/disasm.rs:120` | LR/SC/AMO* |
 | Integration | ⬜ Not started | `friscy-pack` | --aot flag |
 
-### TODO: Dispatch Loop Optimization
+### DONE: Dispatch Loop Optimization (br_table)
 
-**Where**: `rv2wasm/src/wasm_builder.rs` line 90-150
+**Where**: `rv2wasm/src/wasm_builder.rs`
 
-**Problem**: Current dispatch uses linear function calls. Need `br_table` for O(1) dispatch.
+**Status**: ✅ Implemented and tested
 
-**How to fix**:
-```rust
-// In build_dispatch_function(), replace linear calls with:
-// 1. Build table of (pc_address, function_index) pairs
-// 2. Normalize PC to table index: (pc - base_addr) / 4
-// 3. Use br_table to jump to correct block
+The dispatch function now uses O(1) `br_table` dispatch with a PC→index mapping table:
 
-func.instruction(&Instruction::LocalGet(2)); // $pc
-func.instruction(&Instruction::I32Const(base_addr));
-func.instruction(&Instruction::I32Sub);
-func.instruction(&Instruction::I32Const(4));
-func.instruction(&Instruction::I32DivU);
-func.instruction(&Instruction::BrTable(block_targets, default_target));
-```
+1. **Mapping table** at memory offset 256 (after 256-byte register file)
+2. **PC→index**: `table[(pc - min_addr) / 2]` (RVC 2-byte alignment)
+3. **Nested block + br_table** pattern: case i handler branches to loop at depth (n - i)
+4. **Function indices**: 0=syscall import, 1=dispatch, 2+=block functions
+5. **DataSection** contains the mapping table as an active data segment
+
+Validated with wasmparser on both static and dynamic/PIE RISC-V binaries.
 
 ### TODO: Floating-Point Translation
 
@@ -178,12 +174,19 @@ if [ "$AOT" = "true" ]; then
 fi
 ```
 
-### Building rv2wasm
+### Building & Testing rv2wasm
 
 ```bash
 cd rv2wasm
 cargo build --release
 ./target/release/rv2wasm input.elf -o output.wasm --verbose
+
+# Run integration tests (requires cross-compiled test binaries)
+# Build test binaries first:
+riscv64-linux-gnu-gcc -static -nostdlib -o ../tests/test_simple.elf ../tests/test_simple.c
+riscv64-linux-gnu-gcc -o ../tests/test_dynamic.elf ../tests/test_dynamic.c
+# Then run:
+cargo test
 ```
 
 ---
@@ -196,7 +199,9 @@ cargo build --release
 - ✅ ELF PT_INTERP detection
 - ✅ Interpreter loading at 0x40000000
 - ✅ Auxiliary vector setup
-- ⬜ Real container testing
+- ✅ Dynamic/PIE ELF compilation through rv2wasm (tested with `test_dynamic.c`)
+- ✅ Aux vector prerequisites verified (AT_PHDR, AT_PHNUM, AT_ENTRY)
+- ⬜ Real container testing (Alpine busybox)
 
 ### TODO: Alpine busybox Test
 
@@ -328,7 +333,10 @@ friscy/
 │
 ├── rv2wasm/                 # RISC-V → Wasm AOT compiler
 │   ├── Cargo.toml           # Rust dependencies
+│   ├── Cargo.lock           # Locked dependency versions
 │   ├── README.md            # Build and usage instructions
+│   ├── tests/
+│   │   └── integration_test.rs  # 12 end-to-end tests
 │   └── src/
 │       ├── main.rs          # CLI: rv2wasm input.elf -o output.wasm
 │       ├── lib.rs           # Library entry: compile(elf_data, opt, debug)
@@ -339,6 +347,8 @@ friscy/
 │       └── wasm_builder.rs  # Wasm binary generation
 │
 ├── tests/
+│   ├── test_simple.c        # Static RISC-V test (raw syscalls)
+│   ├── test_dynamic.c       # Dynamic/PIE test (libc, printf)
 │   ├── test_http_minimal.c  # HTTP client test
 │   ├── test_server.py       # Simple HTTP server
 │   └── run_network_test.sh  # Automated test script
@@ -373,20 +383,22 @@ friscy/
 
 ## Next Steps (In Order)
 
-### This Week
-1. ⬜ Build and test rv2wasm with simple RISC-V binary
-2. ⬜ Test Alpine busybox with dynamic linker
-3. ⬜ Fix any missing syscalls discovered in testing
+### Completed
+1. ✅ Build and test rv2wasm with simple RISC-V binary
+2. ✅ Test dynamic/PIE ELF through rv2wasm pipeline
+3. ✅ Implement br_table dispatch in rv2wasm
+4. ✅ End-to-end integration tests (12 tests passing)
 
-### Next Week
-4. ⬜ Implement br_table dispatch in rv2wasm
-5. ⬜ Add floating-point translation
-6. ⬜ Integrate rv2wasm with friscy-pack --aot
+### Up Next
+5. ⬜ Add floating-point translation (F/D extensions in `translate.rs`)
+6. ⬜ Add atomics translation (LR/SC/AMO in `translate.rs`)
+7. ⬜ Integrate rv2wasm with friscy-pack --aot
+8. ⬜ Test Alpine busybox with dynamic linker (full container)
 
-### Following Week
-7. ⬜ Implement Wizer snapshot support
-8. ⬜ End-to-end test: Docker → browser with AOT
-9. ⬜ Performance benchmarks vs WebVM
+### Following
+9. ⬜ Implement Wizer snapshot support
+10. ⬜ End-to-end test: Docker → browser with AOT
+11. ⬜ Performance benchmarks vs WebVM
 
 ---
 
