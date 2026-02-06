@@ -58,6 +58,231 @@ fn translate_instruction(inst: RiscvInst) -> Vec<WasmInst> {
 - Indirect jumps (function pointers) - need jump tables
 - Syscalls - need trampolines back to host
 
+#### Deep Dive: Build-Time AOT Architecture
+
+The idea: **at `friscy-pack` time, compile RISC-V → Wasm directly**. No interpreter ships to browser.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        friscy-pack Pipeline                                  │
+│                                                                              │
+│   Input: Docker image                                                        │
+│     │                                                                        │
+│     ▼                                                                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  1. Extract RISC-V ELF binaries from rootfs                         │   │
+│   │     /bin/busybox, /usr/bin/python3, /lib/*.so                       │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│     │                                                                        │
+│     ▼                                                                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  2. Disassemble to basic blocks                                      │   │
+│   │                                                                      │   │
+│   │     0x1000: addi  x1, x0, 5      ┐                                  │   │
+│   │     0x1004: addi  x2, x0, 10     │ Block A                          │   │
+│   │     0x1008: add   x3, x1, x2     │                                  │   │
+│   │     0x100c: beq   x3, x0, 0x1020 ┘ (branch = block boundary)        │   │
+│   │     0x1010: mul   x4, x1, x2     ┐                                  │   │
+│   │     0x1014: j     0x1024         ┘ Block B                          │   │
+│   │     0x1020: sub   x4, x1, x2     ─ Block C                          │   │
+│   │     0x1024: ...                  ─ Block D                          │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│     │                                                                        │
+│     ▼                                                                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  3. Translate each block to Wasm                                     │   │
+│   │                                                                      │   │
+│   │  (func $block_1000 (param $m i32) (result i32)                      │   │
+│   │    ;; x1 = 5                                                         │   │
+│   │    (i64.store offset=8 (local.get $m) (i64.const 5))                │   │
+│   │    ;; x2 = 10                                                        │   │
+│   │    (i64.store offset=16 (local.get $m) (i64.const 10))              │   │
+│   │    ;; x3 = x1 + x2                                                   │   │
+│   │    (i64.store offset=24 (local.get $m)                              │   │
+│   │      (i64.add                                                        │   │
+│   │        (i64.load offset=8 (local.get $m))                           │   │
+│   │        (i64.load offset=16 (local.get $m))))                        │   │
+│   │    ;; if x3 == 0, goto 0x1020, else fall through to 0x1010          │   │
+│   │    (if (i64.eqz (i64.load offset=24 (local.get $m)))                │   │
+│   │      (then (return (i32.const 0x1020)))                             │   │
+│   │      (else (return (i32.const 0x1010)))))                           │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│     │                                                                        │
+│     ▼                                                                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  4. Generate dispatch table                                          │   │
+│   │                                                                      │   │
+│   │  (func $run (param $m i32) (param $start_pc i32)                    │   │
+│   │    (local $pc i32)                                                   │   │
+│   │    (local.set $pc (local.get $start_pc))                            │   │
+│   │    (loop $dispatch                                                   │   │
+│   │      (local.set $pc                                                  │   │
+│   │        (call_indirect (type $block_t)                               │   │
+│   │          (local.get $m)                                              │   │
+│   │          (i32.div_u (local.get $pc) (i32.const 4))))                │   │
+│   │      (br_if $dispatch                                                │   │
+│   │        (i32.ne (local.get $pc) (i32.const -1)))))                   │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│     │                                                                        │
+│     ▼                                                                        │
+│   Output: app.wasm (native-speed execution!)                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Translation Rules (RISC-V → Wasm)
+
+```
+RISC-V                          Wasm
+────────────────────────────────────────────────────────────────────────
+add  rd, rs1, rs2      →   i64.store offset=rd*8 (local.get $m)
+                              (i64.add
+                                (i64.load offset=rs1*8 (local.get $m))
+                                (i64.load offset=rs2*8 (local.get $m)))
+
+addi rd, rs1, imm      →   i64.store offset=rd*8 (local.get $m)
+                              (i64.add
+                                (i64.load offset=rs1*8 (local.get $m))
+                                (i64.const imm))
+
+lw   rd, offset(rs1)   →   i64.store offset=rd*8 (local.get $m)
+                              (i64.load32_s
+                                (i32.add
+                                  (i32.wrap_i64 (i64.load offset=rs1*8 ...))
+                                  (i32.const offset)))
+
+sw   rs2, offset(rs1)  →   i64.store
+                              (i32.add ...)
+                              (i64.load offset=rs2*8 ...)
+
+beq  rs1, rs2, target  →   if (i64.eq (i64.load rs1) (i64.load rs2))
+                              (return (i32.const target))
+                            else
+                              (return (i32.const next_pc))
+
+ecall                  →   return (i32.or
+                              (i32.const 0x80000000)  ;; syscall flag
+                              (i32.const pc))         ;; for handler
+```
+
+#### Handling the Hard Parts
+
+**1. Indirect Jumps (jalr, function pointers)**
+```
+jalr rd, rs1, offset   →   ;; rd = pc + 4
+                           i64.store offset=rd*8 (local.get $m)
+                             (i64.const (pc + 4))
+                           ;; return target address for dispatch
+                           return (i32.wrap_i64
+                             (i64.add
+                               (i64.load offset=rs1*8 (local.get $m))
+                               (i64.const offset)))
+```
+The dispatch loop handles jumping to the right block.
+
+**2. Syscalls (ecall)**
+```
+ecall                  →   ;; Return special value to signal syscall
+                           return (i32.const 0xFFFFFFFF)
+```
+The dispatch loop checks for this and calls the syscall handler.
+
+**3. Memory Access**
+Guest memory lives in a Wasm linear memory. Load/store translate directly:
+```
+lw rd, 0(rs1)          →   i64.load32_s
+                             (i32.wrap_i64
+                               (i64.load offset=rs1*8 (local.get $m)))
+```
+
+**4. Dynamic Linking**
+Two options:
+- **Eager**: Compile all .so files at build time, link into one Wasm module
+- **Lazy**: Keep interpreter for dynamically loaded code, AOT for main binary
+
+#### Tool Architecture
+
+```
+rv2wasm/
+├── src/
+│   ├── main.rs              # CLI: rv2wasm input.elf -o output.wasm
+│   ├── elf.rs               # ELF parser
+│   ├── disasm.rs            # RISC-V disassembler
+│   ├── cfg.rs               # Control flow graph builder
+│   ├── translate.rs         # RISC-V → Wasm translation
+│   ├── wasm_builder.rs      # Wasm module construction
+│   └── optimize.rs          # Peephole optimizations
+├── Cargo.toml
+└── tests/
+    ├── basic_ops.rs
+    ├── branches.rs
+    └── syscalls.rs
+```
+
+**Why Rust?**
+- `goblin` crate for ELF parsing
+- `wasmparser`/`wasm-encoder` for Wasm
+- Fast compilation
+- Can compile to Wasm itself (run rv2wasm in browser!)
+
+#### Performance Comparison
+
+| Approach | Instruction Cost | Dispatch Cost | Memory Access |
+|----------|------------------|---------------|---------------|
+| Interpreter | ~20 Wasm ops | switch + br_table | bounds check |
+| Runtime JIT | ~5 Wasm ops | call_indirect | direct |
+| **Build-time AOT** | **~3 Wasm ops** | **inline/call** | **direct** |
+
+The AOT approach is **5-10x faster** than interpretation because:
+1. No decode step (instruction bits → operation)
+2. No dispatch overhead (already in the right function)
+3. Browser JIT can inline across blocks
+4. Register allocation can use Wasm locals
+
+#### Example: Fibonacci
+
+```c
+// C source
+int fib(int n) {
+    if (n <= 1) return n;
+    return fib(n-1) + fib(n-2);
+}
+```
+
+```asm
+# RISC-V assembly
+fib:
+    addi sp, sp, -16
+    sw   ra, 12(sp)
+    sw   s0, 8(sp)
+    mv   s0, a0
+    li   a5, 1
+    ble  a0, a5, .L1
+    addi a0, a0, -1
+    call fib
+    mv   a5, a0
+    addi a0, s0, -2
+    call fib
+    add  a0, a0, a5
+.L1:
+    lw   ra, 12(sp)
+    lw   s0, 8(sp)
+    addi sp, sp, 16
+    ret
+```
+
+```wat
+;; AOT-compiled Wasm (simplified)
+(func $fib (param $m i32) (param $n i64) (result i64)
+  (if (result i64) (i64.le_s (local.get $n) (i64.const 1))
+    (then (local.get $n))
+    (else
+      (i64.add
+        (call $fib (local.get $m) (i64.sub (local.get $n) (i64.const 1)))
+        (call $fib (local.get $m) (i64.sub (local.get $n) (i64.const 2)))))))
+```
+
+The browser JIT sees clean Wasm and optimizes it like native code!
+
 ---
 
 ### 2. Wasm Tail Calls (BLOCKED - Browser Limitation)
