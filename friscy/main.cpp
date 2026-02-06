@@ -9,12 +9,14 @@
 //
 // The binary can be:
 //   - A standalone statically-linked RISC-V ELF
+//   - A dynamically-linked binary (will load ld-musl-riscv64.so.1)
 //   - An entry point from a container rootfs (with --rootfs)
 
 #include <libriscv/machine.hpp>
 #include "vfs.hpp"
 #include "syscalls.hpp"
 #include "network.hpp"
+#include "elf_loader.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -205,8 +207,58 @@ int main(int argc, char** argv) {
 
         std::cout << "[friscy] Valid RV64 ELF detected\n";
 
-        // Create machine
+        // Parse ELF to check for dynamic linking
+        elf::ElfInfo exec_info = elf::parse_elf(binary);
+        std::cout << "[friscy] ELF type: " << (exec_info.type == elf::ET_DYN ? "PIE/shared" : "executable") << "\n";
+
+        std::vector<uint8_t> interp_binary;
+        elf::ElfInfo interp_info;
+        uint64_t interp_base = 0;
+        bool use_dynamic_linker = false;
+
+        if (exec_info.is_dynamic && container_mode) {
+            std::cout << "[friscy] Dynamic binary detected\n";
+            std::cout << "[friscy] Interpreter: " << exec_info.interpreter << "\n";
+
+            // Load the dynamic linker from VFS
+            try {
+                interp_binary = load_from_vfs(exec_info.interpreter);
+                interp_info = elf::parse_elf(interp_binary);
+                use_dynamic_linker = true;
+                std::cout << "[friscy] Loaded interpreter: " << interp_binary.size() << " bytes\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[friscy] Warning: Could not load interpreter: " << e.what() << "\n";
+                std::cerr << "[friscy] Trying to run as static binary...\n";
+            }
+        }
+
+        // Create machine with main executable
         Machine machine{binary};
+
+        // If dynamic, also load the interpreter at a high address
+        if (use_dynamic_linker) {
+            // Load interpreter at 0x40000000 (1GB mark)
+            // This is above typical executable addresses but below stack
+            interp_base = 0x40000000;
+
+            std::cout << "[friscy] Loading interpreter at 0x" << std::hex << interp_base << std::dec << "\n";
+
+            // Load interpreter segments
+            dynlink::load_elf_segments(machine, interp_binary, interp_base);
+
+            // Update interpreter entry point with base offset
+            uint64_t interp_entry = interp_info.entry_point;
+            if (interp_info.type == elf::ET_DYN) {
+                // PIE interpreter - adjust entry point
+                auto [lo, hi] = elf::get_load_range(interp_binary);
+                interp_entry = interp_info.entry_point - lo + interp_base;
+            }
+
+            std::cout << "[friscy] Interpreter entry: 0x" << std::hex << interp_entry << std::dec << "\n";
+
+            // We'll jump to interpreter's entry point instead of main binary's
+            machine.cpu.jump(interp_entry);
+        }
 
         // Set up Linux syscall emulation (provided by libriscv)
         machine.setup_linux_syscalls();
@@ -237,8 +289,36 @@ int main(int argc, char** argv) {
         }
 
         // Set up program arguments and environment
-        // libriscv expects std::vector<std::string>
-        machine.setup_argv(guest_args, env);
+        if (use_dynamic_linker) {
+            // For dynamic linking, set up stack with aux vector
+            std::cout << "[friscy] Setting up aux vector for dynamic linker\n";
+
+            // Adjust exec_info.phdr_addr if it's relative
+            // For PIE executables, phdr_addr is relative to load address
+            elf::ElfInfo adjusted_exec_info = exec_info;
+            if (exec_info.type == elf::ET_DYN) {
+                // PIE executable - phdr_addr needs adjustment
+                // libriscv loads PIE at a base address, need to find it
+                // For now assume loaded at low address as specified in ELF
+            }
+
+            uint64_t sp = dynlink::setup_dynamic_stack(
+                machine,
+                adjusted_exec_info,
+                interp_base,
+                guest_args,
+                env,
+                0x7fff0000  // Stack top
+            );
+
+            // Set stack pointer
+            machine.cpu.reg(riscv::REG_SP) = sp;
+
+            std::cout << "[friscy] Stack pointer: 0x" << std::hex << sp << std::dec << "\n";
+        } else {
+            // Static binary - use libriscv's standard setup
+            machine.setup_argv(guest_args, env);
+        }
 
         // Route guest stdout/stderr to host
         machine.set_printer([](const auto&, const char* data, size_t len) {

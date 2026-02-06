@@ -71,24 +71,41 @@ target_include_directories(friscy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 # --- Compile flags ---
 if(FRISCY_PRODUCTION)
     # Maximum performance for production
-    target_compile_options(friscy PRIVATE
-        -O3
-        -flto
-        -fno-rtti
-        -fexceptions
-        -DNDEBUG
-        -msimd128              # WASM SIMD
-        -mbulk-memory          # Fast memcpy/memset
-        -mnontrapping-fptoint  # Faster FP conversions
-    )
+    if(EMSCRIPTEN)
+        target_compile_options(friscy PRIVATE
+            -O3
+            -flto
+            -fno-rtti
+            -fexceptions
+            -DNDEBUG
+            -msimd128              # WASM SIMD
+            -mbulk-memory          # Fast memcpy/memset
+            -mnontrapping-fptoint  # Faster FP conversions
+        )
+    else()
+        target_compile_options(friscy PRIVATE
+            -O3
+            -flto
+            -fno-rtti
+            -fexceptions
+            -DNDEBUG
+        )
+    endif()
 else()
-    # Development build - still enable SIMD for testing
-    target_compile_options(friscy PRIVATE
-        -O2
-        -fexceptions
-        -msimd128              # WASM SIMD (2-4x faster memcpy)
-        -mbulk-memory          # Fast memcpy/memset intrinsics
-    )
+    # Development build
+    if(EMSCRIPTEN)
+        target_compile_options(friscy PRIVATE
+            -O2
+            -fexceptions
+            -msimd128              # WASM SIMD (2-4x faster memcpy)
+            -mbulk-memory          # Fast memcpy/memset intrinsics
+        )
+    else()
+        target_compile_options(friscy PRIVATE
+            -O2
+            -fexceptions
+        )
+    endif()
 endif()
 
 # --- Link flags ---

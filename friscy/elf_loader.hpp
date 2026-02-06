@@ -16,6 +16,7 @@
 #include <vector>
 #include <optional>
 #include <stdexcept>
+#include <libriscv/machine.hpp>
 
 namespace elf {
 
@@ -273,3 +274,258 @@ inline std::vector<std::pair<uint64_t, uint64_t>> build_auxv(
 }
 
 }  // namespace elf
+
+// =============================================================================
+// Dynamic Linker Support
+//
+// For dynamically linked binaries:
+// 1. Load the main executable's ELF headers
+// 2. Find PT_INTERP (e.g., /lib/ld-musl-riscv64.so.1)
+// 3. Load the interpreter from VFS
+// 4. Set up stack with aux vector
+// 5. Jump to interpreter's entry point
+//
+// The interpreter (musl's ld.so) will:
+// - Read aux vector to find main executable's headers
+// - Load required shared libraries
+// - Perform relocations
+// - Jump to main executable's entry point
+// =============================================================================
+
+namespace dynlink {
+
+using Machine = riscv::Machine<riscv::RISCV64>;
+
+// Stack layout for dynamic linker (grows down):
+//
+// High addresses
+// ┌──────────────────────────────┐
+// │ Platform string "riscv64\0" │
+// │ Random bytes (16)            │
+// │ Executable name string       │
+// │ Environment strings          │
+// │ Argument strings             │
+// ├──────────────────────────────┤
+// │ NULL                         │  auxv terminator
+// │ AT_NULL, 0                   │
+// │ AT_PLATFORM, ptr             │
+// │ AT_RANDOM, ptr               │
+// │ ...                          │
+// │ AT_PHDR, phdr_addr           │
+// ├──────────────────────────────┤
+// │ NULL                         │  envp terminator
+// │ env[n] pointer               │
+// │ ...                          │
+// │ env[0] pointer               │
+// ├──────────────────────────────┤
+// │ NULL                         │  argv terminator
+// │ argv[argc-1] pointer         │
+// │ ...                          │
+// │ argv[0] pointer              │
+// ├──────────────────────────────┤
+// │ argc                         │
+// └──────────────────────────────┘ ← sp
+// Low addresses
+
+// Load an ELF file into memory at the specified base
+// Returns the actual base address used (may differ for PIE)
+inline uint64_t load_elf_segments(
+    Machine& machine,
+    const std::vector<uint8_t>& elf_data,
+    uint64_t requested_base = 0
+) {
+    const auto* ehdr = reinterpret_cast<const elf::Elf64_Ehdr*>(elf_data.data());
+
+    // For PIE/shared objects, we can load at any address
+    // For ET_EXEC, we must load at the specified addresses
+    uint64_t base_adjust = 0;
+    if (ehdr->e_type == elf::ET_DYN && requested_base != 0) {
+        // Find lowest vaddr to calculate adjustment
+        auto [lo, hi] = elf::get_load_range(elf_data);
+        base_adjust = requested_base - lo;
+    }
+
+    size_t phoff = ehdr->e_phoff;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const auto* phdr = reinterpret_cast<const elf::Elf64_Phdr*>(
+            elf_data.data() + phoff);
+
+        if (phdr->p_type == elf::PT_LOAD) {
+            uint64_t vaddr = phdr->p_vaddr + base_adjust;
+            uint64_t filesz = phdr->p_filesz;
+            uint64_t memsz = phdr->p_memsz;
+
+            // Copy file data
+            if (filesz > 0) {
+                machine.memory.memcpy(
+                    vaddr,
+                    elf_data.data() + phdr->p_offset,
+                    filesz
+                );
+            }
+
+            // Zero BSS (memsz > filesz)
+            if (memsz > filesz) {
+                machine.memory.memset(vaddr + filesz, 0, memsz - filesz);
+            }
+        }
+
+        phoff += ehdr->e_phentsize;
+    }
+
+    return base_adjust;
+}
+
+// Set up the stack for the dynamic linker
+// Returns the initial stack pointer
+inline uint64_t setup_dynamic_stack(
+    Machine& machine,
+    const elf::ElfInfo& exec_info,
+    uint64_t interp_base,
+    const std::vector<std::string>& args,
+    const std::vector<std::string>& env,
+    uint64_t stack_top = 0x7fff0000
+) {
+    uint64_t sp = stack_top;
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Write strings to stack
+    // -------------------------------------------------------------------------
+
+    // Platform string
+    const char* platform = "riscv64";
+    sp -= 8;
+    sp &= ~7;  // Align
+    uint64_t platform_addr = sp;
+    machine.memory.memcpy(sp, platform, strlen(platform) + 1);
+
+    // Random bytes (16 bytes for AT_RANDOM)
+    sp -= 16;
+    uint64_t random_addr = sp;
+    // In production, use actual random bytes
+    for (int i = 0; i < 16; i++) {
+        machine.memory.template write<uint8_t>(sp + i, (uint8_t)(i * 17 + 42));
+    }
+
+    // Executable name
+    std::string execfn = args.empty() ? "/bin/program" : args[0];
+    sp -= execfn.size() + 1;
+    sp &= ~7;
+    uint64_t execfn_addr = sp;
+    machine.memory.memcpy(sp, execfn.c_str(), execfn.size() + 1);
+
+    // Environment strings
+    std::vector<uint64_t> env_ptrs;
+    for (const auto& e : env) {
+        sp -= e.size() + 1;
+        env_ptrs.push_back(sp);
+        machine.memory.memcpy(sp, e.c_str(), e.size() + 1);
+    }
+
+    // Argument strings
+    std::vector<uint64_t> arg_ptrs;
+    for (const auto& a : args) {
+        sp -= a.size() + 1;
+        arg_ptrs.push_back(sp);
+        machine.memory.memcpy(sp, a.c_str(), a.size() + 1);
+    }
+
+    // Align to 16 bytes
+    sp &= ~15;
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Build auxiliary vector
+    // -------------------------------------------------------------------------
+
+    std::vector<std::pair<uint64_t, uint64_t>> auxv;
+
+    // Program headers of main executable
+    auxv.push_back({elf::AT_PHDR,  exec_info.phdr_addr});
+    auxv.push_back({elf::AT_PHENT, exec_info.phdr_size});
+    auxv.push_back({elf::AT_PHNUM, exec_info.phdr_count});
+
+    // Entry point of main executable
+    auxv.push_back({elf::AT_ENTRY, exec_info.entry_point});
+
+    // Interpreter base (where ld-musl was loaded)
+    auxv.push_back({elf::AT_BASE, interp_base});
+
+    // Page size
+    auxv.push_back({elf::AT_PAGESZ, 4096});
+
+    // User/group IDs
+    auxv.push_back({elf::AT_UID,  0});
+    auxv.push_back({elf::AT_EUID, 0});
+    auxv.push_back({elf::AT_GID,  0});
+    auxv.push_back({elf::AT_EGID, 0});
+
+    // Hardware capabilities
+    auxv.push_back({elf::AT_HWCAP, elf::RISCV_HWCAP_IMAFDC});
+
+    // Clock ticks
+    auxv.push_back({elf::AT_CLKTCK, 100});
+
+    // Security
+    auxv.push_back({elf::AT_SECURE, 0});
+
+    // Random bytes pointer
+    auxv.push_back({elf::AT_RANDOM, random_addr});
+
+    // Executable filename
+    auxv.push_back({elf::AT_EXECFN, execfn_addr});
+
+    // Platform string
+    auxv.push_back({elf::AT_PLATFORM, platform_addr});
+
+    // Terminator
+    auxv.push_back({elf::AT_NULL, 0});
+
+    // -------------------------------------------------------------------------
+    // Phase 3: Write auxv, envp, argv, argc to stack
+    // -------------------------------------------------------------------------
+
+    // Calculate how much space we need
+    size_t auxv_size = auxv.size() * 16;  // Each entry is 2 x 8 bytes
+    size_t envp_size = (env_ptrs.size() + 1) * 8;  // +1 for NULL
+    size_t argv_size = (arg_ptrs.size() + 1) * 8;  // +1 for NULL
+    size_t argc_size = 8;
+
+    size_t total = auxv_size + envp_size + argv_size + argc_size;
+
+    sp -= total;
+    sp &= ~15;  // 16-byte align
+
+    uint64_t write_ptr = sp;
+
+    // argc
+    machine.memory.template write<uint64_t>(write_ptr, arg_ptrs.size());
+    write_ptr += 8;
+
+    // argv pointers
+    for (uint64_t ptr : arg_ptrs) {
+        machine.memory.template write<uint64_t>(write_ptr, ptr);
+        write_ptr += 8;
+    }
+    machine.memory.template write<uint64_t>(write_ptr, 0);  // NULL
+    write_ptr += 8;
+
+    // envp pointers
+    for (uint64_t ptr : env_ptrs) {
+        machine.memory.template write<uint64_t>(write_ptr, ptr);
+        write_ptr += 8;
+    }
+    machine.memory.template write<uint64_t>(write_ptr, 0);  // NULL
+    write_ptr += 8;
+
+    // auxv
+    for (const auto& [type, value] : auxv) {
+        machine.memory.template write<uint64_t>(write_ptr, type);
+        write_ptr += 8;
+        machine.memory.template write<uint64_t>(write_ptr, value);
+        write_ptr += 8;
+    }
+
+    return sp;
+}
+
+}  // namespace dynlink
