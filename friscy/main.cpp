@@ -1,81 +1,285 @@
+// main.cpp - friscy: Docker container runner via libriscv
+//
+// This runs RISC-V binaries extracted from Docker containers in userland
+// emulation mode (no kernel boot, syscalls handled by host).
+//
+// Usage:
+//   friscy <riscv64-elf-binary> [args...]
+//   friscy --rootfs <rootfs.tar> <entry-binary> [args...]
+//
+// The binary can be:
+//   - A standalone statically-linked RISC-V ELF
+//   - An entry point from a container rootfs (with --rootfs)
+
 #include <libriscv/machine.hpp>
+#include "vfs.hpp"
+#include "syscalls.hpp"
+
 #include <iostream>
-#include <vector>
-#include <string_view>
 #include <fstream>
+#include <vector>
+#include <string>
+#include <cstring>
 
 using Machine = riscv::Machine<riscv::RISCV64>;
-static constexpr uint64_t MAX_INSTRUCTIONS = 16'000'000'000ULL;
+
+// Configuration
+static constexpr uint64_t MAX_INSTRUCTIONS = 16'000'000'000ULL;  // 16 billion
 static constexpr uint32_t HEAP_SYSCALLS_BASE = 480;
 static constexpr uint32_t MEMORY_SYSCALLS_BASE = 485;
 
-int main(int argc, char** argv)
-{
-    // Load guest binary from file or embedded data
-    std::vector<uint8_t> binary;
+// Global VFS instance (needed for syscall handlers)
+static vfs::VirtualFS g_vfs;
 
-    if (argc > 1) {
-        // Load from file path argument
-        std::ifstream file(argv[1], std::ios::binary | std::ios::ate);
-        if (!file) {
-            std::cerr << "Error: Could not open " << argv[1] << std::endl;
+// Load a file into memory
+static std::vector<uint8_t> load_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        throw std::runtime_error("Could not open: " + path);
+    }
+    auto size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(size);
+    file.read(reinterpret_cast<char*>(data.data()), size);
+    return data;
+}
+
+// Load binary from VFS (for container mode)
+static std::vector<uint8_t> load_from_vfs(const std::string& path) {
+    int fd = g_vfs.open(path, 0);
+    if (fd < 0) {
+        throw std::runtime_error("VFS: Could not open: " + path);
+    }
+
+    vfs::Entry entry;
+    if (!g_vfs.stat(path, entry)) {
+        g_vfs.close(fd);
+        throw std::runtime_error("VFS: Could not stat: " + path);
+    }
+
+    std::vector<uint8_t> data(entry.size);
+    ssize_t n = g_vfs.read(fd, data.data(), data.size());
+    g_vfs.close(fd);
+
+    if (n < 0 || static_cast<size_t>(n) != entry.size) {
+        throw std::runtime_error("VFS: Read error: " + path);
+    }
+
+    return data;
+}
+
+// Setup virtual /proc and /dev entries
+static void setup_virtual_files() {
+    // /dev/null
+    g_vfs.add_virtual_file("/dev/null", std::vector<uint8_t>{});
+
+    // /dev/urandom (reads will be handled by getrandom syscall)
+    g_vfs.add_virtual_file("/dev/urandom", std::vector<uint8_t>{});
+    g_vfs.add_virtual_file("/dev/random", std::vector<uint8_t>{});
+
+    // /etc/passwd (minimal)
+    g_vfs.add_virtual_file("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
+
+    // /etc/group (minimal)
+    g_vfs.add_virtual_file("/etc/group", "root:x:0:\n");
+
+    // /etc/hosts
+    g_vfs.add_virtual_file("/etc/hosts", "127.0.0.1 localhost\n");
+
+    // /etc/resolv.conf
+    g_vfs.add_virtual_file("/etc/resolv.conf", "nameserver 8.8.8.8\n");
+}
+
+// Print usage
+static void usage(const char* argv0) {
+    std::cerr << "friscy - Docker container runner via libriscv\n\n";
+    std::cerr << "Usage:\n";
+    std::cerr << "  " << argv0 << " <riscv64-elf-binary> [args...]\n";
+    std::cerr << "  " << argv0 << " --rootfs <rootfs.tar> <entry-binary> [args...]\n";
+    std::cerr << "\nExamples:\n";
+    std::cerr << "  " << argv0 << " ./hello                    # Run standalone binary\n";
+    std::cerr << "  " << argv0 << " --rootfs alpine.tar /bin/busybox ls -la\n";
+    std::cerr << "  " << argv0 << " --rootfs myapp.tar /app/server --port 8080\n";
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    std::string rootfs_path;
+    std::string entry_path;
+    std::vector<std::string> guest_args;
+    bool container_mode = false;
+
+    // Parse arguments
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "--rootfs") == 0) {
+            if (i + 2 >= argc) {
+                std::cerr << "Error: --rootfs requires <tarfile> and <entry-binary>\n";
+                return 1;
+            }
+            container_mode = true;
+            rootfs_path = argv[++i];
+            entry_path = argv[++i];
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else if (argv[i][0] == '-' && !container_mode) {
+            std::cerr << "Error: Unknown option: " << argv[i] << "\n";
             return 1;
+        } else {
+            if (!container_mode && entry_path.empty()) {
+                entry_path = argv[i];
+            }
+            // Collect remaining args for the guest
+            while (i < argc) {
+                guest_args.push_back(argv[i++]);
+            }
+            break;
         }
-        auto size = file.tellg();
-        file.seekg(0, std::ios::beg);
-        binary.resize(size);
-        file.read(reinterpret_cast<char*>(binary.data()), size);
-    } else {
-        std::cerr << "Usage: friscy <riscv64-elf-binary>" << std::endl;
-        std::cerr << "  Cross-compile guest with: riscv64-linux-gnu-gcc -static -o guest guest.c" << std::endl;
+        i++;
+    }
+
+    if (entry_path.empty()) {
+        std::cerr << "Error: No entry binary specified\n";
         return 1;
     }
 
     try {
+        std::vector<uint8_t> binary;
+
+        if (container_mode) {
+            std::cout << "[friscy] Loading rootfs: " << rootfs_path << "\n";
+
+            // Load tar into VFS
+            auto tar_data = load_file(rootfs_path);
+            if (!g_vfs.load_tar(tar_data.data(), tar_data.size())) {
+                std::cerr << "Error: Failed to parse rootfs tar\n";
+                return 1;
+            }
+
+            // Setup virtual files
+            setup_virtual_files();
+
+            // Update /proc/self/exe
+            g_vfs.add_virtual_file("/proc/self/exe", entry_path);
+
+            std::cout << "[friscy] Entry point: " << entry_path << "\n";
+
+            // Load binary from VFS
+            binary = load_from_vfs(entry_path);
+
+            std::cout << "[friscy] Binary size: " << binary.size() << " bytes\n";
+        } else {
+            // Standalone mode - load binary from host filesystem
+            std::cout << "[friscy] Loading binary: " << entry_path << "\n";
+            binary = load_file(entry_path);
+
+            // Still set up minimal VFS for /proc, /dev
+            setup_virtual_files();
+        }
+
+        // Verify it's a RISC-V ELF
+        if (binary.size() < 64 ||
+            binary[0] != 0x7f || binary[1] != 'E' || binary[2] != 'L' || binary[3] != 'F') {
+            std::cerr << "Error: Not a valid ELF file\n";
+            return 1;
+        }
+
+        // Check architecture (e_machine at offset 18-19, should be 0xF3 for RISC-V)
+        uint16_t e_machine = binary[18] | (binary[19] << 8);
+        if (e_machine != 0xF3) {
+            std::cerr << "Error: Not a RISC-V binary (e_machine=" << e_machine << ")\n";
+            return 1;
+        }
+
+        // Check class (64-bit)
+        if (binary[4] != 2) {
+            std::cerr << "Error: Not a 64-bit ELF (only RV64 supported)\n";
+            return 1;
+        }
+
+        std::cout << "[friscy] Valid RV64 ELF detected\n";
+
+        // Create machine
         Machine machine{binary};
 
-        // Set up Linux syscall emulation
+        // Set up Linux syscall emulation (provided by libriscv)
         machine.setup_linux_syscalls();
 
-        // Set up heap and memory management syscalls
-        const auto heap_area = machine.memory.mmap_allocate(32ULL << 20); // 32MB heap
-        machine.setup_native_heap(HEAP_SYSCALLS_BASE, heap_area, 32ULL << 20);
+        // Set up heap and memory management
+        const auto heap_area = machine.memory.mmap_allocate(64ULL << 20);  // 64MB heap
+        machine.setup_native_heap(HEAP_SYSCALLS_BASE, heap_area, 64ULL << 20);
         machine.setup_native_memory(MEMORY_SYSCALLS_BASE);
+
+        // Install our VFS-backed syscall handlers
+        syscalls::SyscallHandler syscall_handler(g_vfs);
+        syscall_handler.install(machine);
+
+        // Set up environment variables
+        std::vector<std::string> env = {
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+            "USER=root",
+            "TERM=xterm-256color",
+            "LANG=C.UTF-8",
+        };
+
+        // Set up argv
+        if (guest_args.empty()) {
+            guest_args.push_back(entry_path);
+        }
+
+        // Convert to C-style arrays for libriscv
+        std::vector<const char*> c_args;
+        for (const auto& arg : guest_args) {
+            c_args.push_back(arg.c_str());
+        }
+
+        std::vector<const char*> c_env;
+        for (const auto& e : env) {
+            c_env.push_back(e.c_str());
+        }
+
+        // Set up program arguments and environment
+        machine.setup_argv(c_args, c_env);
 
         // Route guest stdout/stderr to host
         machine.set_printer([](const auto&, const char* data, size_t len) {
             std::cout.write(data, len);
+            std::cout.flush();
         });
 
-        // Custom 9P syscall handler (syscall 500)
-        machine.install_syscall_handler(500, [](Machine& m) {
-            auto buffer_addr = m.sysarg(0);
-            auto buffer_len  = m.template sysarg<uint32_t>(1);
-            try {
-                auto view = m.memory.memview(buffer_addr, buffer_len);
-                std::cout << "[9P] " << std::string_view(
-                    reinterpret_cast<const char*>(view.data()), buffer_len
-                ) << std::endl;
-                m.set_result(0);
-            } catch (const std::exception& e) {
-                std::cerr << "[9P] Memory error: " << e.what() << std::endl;
-                m.set_result(-1);
-            }
-        });
+        std::cout << "[friscy] Starting execution...\n";
+        std::cout << "----------------------------------------\n";
 
-        // Run the guest
+        // Run!
         machine.simulate(MAX_INSTRUCTIONS);
 
+        std::cout << "----------------------------------------\n";
+
+        // Report results
         auto [instructions, _] = machine.get_counters();
-        std::cout << "Instructions executed: " << instructions << std::endl;
+        auto exit_code = machine.return_value();
+
+        std::cout << "[friscy] Execution complete\n";
+        std::cout << "[friscy] Instructions: " << instructions << "\n";
+        std::cout << "[friscy] Exit code: " << exit_code << "\n";
+
+        return static_cast<int>(exit_code);
 
     } catch (const riscv::MachineException& e) {
-        std::cerr << "Machine exception: " << e.what()
-                  << " (data: " << e.data() << ")" << std::endl;
+        std::cerr << "\n[friscy] Machine exception: " << e.what();
+        if (e.data() != 0) {
+            std::cerr << " (data: 0x" << std::hex << e.data() << std::dec << ")";
+        }
+        std::cerr << "\n";
         return 1;
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        std::cerr << "\n[friscy] Error: " << e.what() << "\n";
         return 1;
     }
-    return 0;
 }

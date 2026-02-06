@@ -66,6 +66,9 @@ add_subdirectory(src/libriscv/lib)
 add_executable(friscy main.cpp)
 target_link_libraries(friscy PUBLIC riscv)
 
+# Include directories for our headers (vfs.hpp, syscalls.hpp)
+target_include_directories(friscy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # --- Compile flags ---
 target_compile_options(friscy PRIVATE
     -O2
