@@ -189,7 +189,19 @@ void BX_CPU_C::cpu_loop(void)
 
       if (BX_CPU_THIS_PTR async_event) break;
 
-      i = getICacheEntry()->i;
+#if BX_WASM_ITERATIVE_TRACE_LINKING
+      // Wasm iterative trace linking: if linkTrace() set a next trace
+      // pointer, use it directly instead of doing a full icache lookup.
+      // This achieves the same optimization as recursive trace linking
+      // but without any recursion (safe for Wasm's bounded stack).
+      if (BX_CPU_THIS_PTR next_linked_trace) {
+        i = BX_CPU_THIS_PTR next_linked_trace;
+        BX_CPU_THIS_PTR next_linked_trace = NULL;
+      } else
+#endif
+      {
+        i = getICacheEntry()->i;
+      }
     }
 #else // BX_SUPPORT_HANDLERS_CHAINING_SPEEDUPS == 0
 
@@ -322,6 +334,67 @@ bxICacheEntry_c* BX_CPU_C::getICacheEntry(void)
 
 #if BX_SUPPORT_HANDLERS_CHAINING_SPEEDUPS && BX_ENABLE_TRACE_LINKING
 
+#if BX_WASM_ITERATIVE_TRACE_LINKING
+
+// Wasm-safe iterative trace linking.
+//
+// The original linkTrace() uses recursive BX_EXECUTE_INSTRUCTION() calls:
+// each linked trace adds a stack frame, and the stack depth check uses
+// host pointer arithmetic (&stack_anchor) that doesn't work in Wasm
+// (Wasm execution stack is separate from linear memory).
+//
+// This version instead sets next_linked_trace and returns to the main
+// cpu_loop(), which picks it up on the next iteration — zero recursion.
+void BX_CPP_AttrRegparmN(1) BX_CPU_C::linkTrace(bxInstruction_c *i)
+{
+  if (bx_dbg.debugger_active)
+    return;
+
+#if BX_SUPPORT_SMP
+  if (BX_SMP_PROCESSORS > 1)
+    return;
+#endif
+
+  if (BX_CPU_THIS_PTR async_event)
+    return;
+
+  Bit32u delta = (Bit32u) (BX_CPU_THIS_PTR icount - BX_CPU_THIS_PTR icount_last_sync);
+  if (delta >= bx_pc_system.getNumCpuTicksLeftNextEvent()) {
+    return;
+  }
+
+  BX_SYNC_TIME_IF_SINGLE_PROCESSOR(0);
+
+  // Check if we already have a cached link to the next trace
+  bxInstruction_c *next = i->getNextTrace(BX_CPU_THIS_PTR iCache.traceLinkTimeStamp);
+  if (next) {
+    // Set the pointer for the main loop to pick up — no recursion
+    BX_CPU_THIS_PTR next_linked_trace = next;
+    return;
+  }
+
+  // Try to find and cache the link
+  bx_address eipBiased = RIP + BX_CPU_THIS_PTR eipPageBias;
+  if (eipBiased >= BX_CPU_THIS_PTR eipPageWindowSize) {
+    prefetch();
+    eipBiased = RIP + BX_CPU_THIS_PTR eipPageBias;
+  }
+
+  INC_ICACHE_STAT(iCacheLookups);
+
+  bx_phy_address pAddr = BX_CPU_THIS_PTR pAddrFetchPage + eipBiased;
+  bxICacheEntry_c *entry = BX_CPU_THIS_PTR iCache.find_entry(pAddr, BX_CPU_THIS_PTR fetchModeMask);
+
+  if (entry != NULL) // link traces - handle only hit cases
+  {
+    i->setNextTrace(entry->i, BX_CPU_THIS_PTR iCache.traceLinkTimeStamp);
+    // Hand off to main loop instead of recursive execute
+    BX_CPU_THIS_PTR next_linked_trace = entry->i;
+  }
+}
+
+#else // !BX_WASM_ITERATIVE_TRACE_LINKING — original recursive version
+
 // The function is called after taken branch instructions and tries to link the branch to the next trace
 void BX_CPP_AttrRegparmN(1) BX_CPU_C::linkTrace(bxInstruction_c *i)
 {
@@ -386,6 +459,8 @@ void BX_CPP_AttrRegparmN(1) BX_CPU_C::linkTrace(bxInstruction_c *i)
     BX_EXECUTE_INSTRUCTION(i);
   }
 }
+
+#endif // BX_WASM_ITERATIVE_TRACE_LINKING
 
 #endif
 

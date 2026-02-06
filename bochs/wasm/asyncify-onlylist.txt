@@ -1,0 +1,205 @@
+# Asyncify onlylist for Bochs compiled to Wasm (WASI or Emscripten)
+#
+# Only functions listed here will be instrumented by Binaryen's Asyncify
+# transform. All other functions (CPU hot loop, instruction handlers, TLB
+# lookups, page walks, memory access) will run WITHOUT Asyncify overhead.
+#
+# Usage with wasm-opt:
+#   wasm-opt bochs --asyncify -O2 -o bochs.async \
+#     --pass-arg=asyncify-onlylist@wasm/asyncify-onlylist.txt
+#
+# Instead of the current container2wasm approach:
+#   wasm-opt bochs --asyncify -O2 -o bochs.async \
+#     --pass-arg=asyncify-ignore-imports
+#
+# The current approach instruments ALL internal function calls. This list
+# restricts instrumentation to only the ~60 functions on the call path
+# from the main Asyncify unwind/rewind loop down to WASI I/O suspension
+# points (fd_read, fd_write, poll_oneoff, sock_recv, sock_send).
+#
+# IMPORTANT: If Bochs traps at runtime with "unreachable" in an Asyncify
+# context, it means a function on the suspension path is missing from this
+# list. Add it and rebuild.
+#
+# Call graph: wasm_start → bx_begin_simulator → ... → WASI I/O
+#
+# ============================================================================
+# Top-level entry points (Asyncify unwind/rewind loop)
+# ============================================================================
+wasm_start
+_start
+__main_void
+__original_main
+
+# ============================================================================
+# Bochs initialization and main simulation entry
+# ============================================================================
+bx_begin_simulator
+bxmain
+bx_init_hardware
+bx_init_options
+
+# ============================================================================
+# CPU main loop — must be instrumented because it calls setjmp/longjmp
+# and is the return point for Asyncify unwind when I/O suspends
+# ============================================================================
+# NOTE: We instrument cpu_loop itself but NOT the instruction handlers
+# it calls. The handlers never suspend — only the I/O device callbacks do,
+# and those return through the device → timer → async_event path.
+_ZN8BX_CPU_C8cpu_loopEv
+cpu_loop
+
+# ============================================================================
+# Async event handling — the path from CPU loop to device callbacks
+# ============================================================================
+_ZN8BX_CPU_C16handleAsyncEventEv
+handleAsyncEvent
+_ZN8BX_CPU_C9interruptEjbbj
+interrupt
+
+# ============================================================================
+# Timer and tick system — connects CPU loop to device polling
+# ============================================================================
+bx_pc_system_c::countdownEvent
+_ZN14bx_pc_system_c14countdownEventEv
+bx_pc_system_c::tickn
+_ZN14bx_pc_system_c5ticknEj
+bx_devices_c::timer_handler
+_ZN11bx_devices_c13timer_handlerEv
+bx_timer_handler
+_ZN14bx_pc_system_c14triggeredTimerEv
+bx_pc_system_c::triggeredTimer
+
+# ============================================================================
+# PIT (Programmable Interval Timer) — drives periodic callbacks
+# ============================================================================
+bx_pit_c::timer_handler
+_ZN8bx_pit_c13timer_handlerEPv
+bx_pit_c::handle_timer
+
+# ============================================================================
+# PCI system — needed for virtio device MMIO dispatch
+# ============================================================================
+bx_pci_device_c::write_handler
+bx_pci_device_c::read_handler
+
+# ============================================================================
+# Virtio device callbacks (container2wasm custom devices)
+# These are the actual suspension points — they call WASI fd_read/fd_write
+# ============================================================================
+# Virtio Console (stdin/stdout via WASI fd 0/1)
+virtio_console_cb
+virtio_console_read
+virtio_console_write
+virtio_console_poll
+virtio_console_handler
+bx_virtio_console_c::timer_handler
+bx_virtio_console_c::virtio_ioport_write
+bx_virtio_console_c::virtio_ioport_read
+
+# Virtio 9P filesystem (WASI fd operations for host file sharing)
+virtio_9p_cb
+virtio_9p_handler
+virtio_9p_read
+virtio_9p_write
+bx_virtio_9p_c::timer_handler
+bx_virtio_9p_c::virtio_ioport_write
+bx_virtio_9p_c::virtio_ioport_read
+
+# Virtio Network (WASI socket operations)
+virtio_net_cb
+virtio_net_handler
+virtio_net_read
+virtio_net_write
+virtio_net_recv
+virtio_net_send
+bx_virtio_net_c::timer_handler
+bx_virtio_net_c::virtio_ioport_write
+bx_virtio_net_c::virtio_ioport_read
+
+# ============================================================================
+# Generic virtio infrastructure (queue processing)
+# ============================================================================
+virtio_queue_notify
+virtio_process_queue
+virtio_consume_desc
+
+# ============================================================================
+# USB EHCI/OHCI — used for rootfs CDROM access
+# ============================================================================
+bx_usb_ehci_c::ehci_frame_handler
+_ZN14bx_usb_ehci_c18ehci_frame_handlerEPv
+bx_usb_ehci_c::raise_irq
+bx_usb_ehci_c::update_frindex
+bx_usb_ehci_c::advance_async_state
+bx_usb_ehci_c::advance_periodic_state
+bx_usb_ehci_c::execute
+bx_usb_ehci_c::execute_complete
+
+# ============================================================================
+# ATA/IDE controller — needed for boot CDROM access
+# ============================================================================
+bx_hard_drive_c::timer_handler
+_ZN15bx_hard_drive_c13timer_handlerEPv
+bx_hard_drive_c::read
+bx_hard_drive_c::write
+
+# ============================================================================
+# Keyboard/serial — these may poll for input
+# ============================================================================
+bx_keyb_c::timer_handler
+bx_serial_c::timer_handler
+_ZN11bx_serial_c13timer_handlerEPv
+
+# ============================================================================
+# CMOS RTC — periodic timer that may yield
+# ============================================================================
+bx_cmos_c::periodic_timer_handler
+bx_cmos_c::one_second_timer_handler
+
+# ============================================================================
+# setjmp/longjmp wrappers (WASI Asyncify-based implementation)
+# ============================================================================
+setjmp
+longjmp
+_setjmp
+_longjmp
+__setjmp
+__longjmp
+jmp_save
+jmp_restore
+
+# ============================================================================
+# WASI I/O primitives (the actual suspension points)
+# These are imported functions but listed here for completeness.
+# With asyncify-onlylist they're already handled, but being explicit
+# ensures correctness if the import handling changes.
+# ============================================================================
+__wasi_fd_read
+__wasi_fd_write
+__wasi_fd_close
+__wasi_fd_seek
+__wasi_fd_fdstat_get
+__wasi_poll_oneoff
+__wasi_sock_recv
+__wasi_sock_send
+__wasi_proc_exit
+fd_read
+fd_write
+poll_oneoff
+
+# ============================================================================
+# Memory allocation that might call sbrk/memory.grow
+# (Wasm memory.grow can be a suspension point in some configurations)
+# ============================================================================
+malloc
+free
+realloc
+calloc
+dlmalloc
+dlfree
+dlrealloc
+sbrk
+__sbrk
+emscripten_builtin_malloc
+emscripten_builtin_free

@@ -52,6 +52,34 @@ void BX_MEM_C::writePhysicalPage(BX_CPU_C *cpu, bx_phy_address addr, unsigned le
     BX_PANIC(("writePhysicalPage: cross page access at address 0x" FMT_PHY_ADDRX ", len=%d", addr, len));
   }
 
+#if BX_WASM_DIRECT_RAM_FASTPATH
+  // Fast path: for normal RAM addresses with no registered handlers,
+  // skip the handler chain traversal and legacy region checks entirely.
+  // This is the hot path for Wasm where most writes go to regular RAM.
+  {
+    Bit8u *direct = wasm_ram_fastpath(a20addr, BX_WRITE);
+    if (BX_LIKELY(direct != NULL)) {
+#if BX_SUPPORT_MONITOR_MWAIT
+      BX_MEM_THIS check_monitor(linear_addr, len);
+#endif
+      pageWriteStampTable.decWriteStamp(a20addr, len);
+      // Dispatch by size for optimal codegen
+      if (len == 4) {
+        WriteHostDWordToLittleEndian((Bit32u*)direct, *(Bit32u*)data);
+      } else if (len == 8) {
+        WriteHostQWordToLittleEndian((Bit64u*)direct, *(Bit64u*)data);
+      } else if (len == 2) {
+        WriteHostWordToLittleEndian((Bit16u*)direct, *(Bit16u*)data);
+      } else if (len == 1) {
+        *direct = *(Bit8u*)data;
+      } else {
+        memcpy(direct, data, len);
+      }
+      return;
+    }
+  }
+#endif // BX_WASM_DIRECT_RAM_FASTPATH
+
 #if BX_SUPPORT_MONITOR_MWAIT
   BX_MEM_THIS check_monitor(linear_addr, len);
 #endif
@@ -198,6 +226,28 @@ void BX_MEM_C::readPhysicalPage(BX_CPU_C *cpu, bx_phy_address addr, unsigned len
   if ((addr>>12) != ((addr+len-1)>>12)) {
     BX_PANIC(("readPhysicalPage: cross page access at address 0x" FMT_PHY_ADDRX ", len=%d", addr, len));
   }
+
+#if BX_WASM_DIRECT_RAM_FASTPATH
+  // Fast path: for normal RAM addresses with no registered handlers,
+  // skip the handler chain traversal entirely.
+  {
+    Bit8u *direct = wasm_ram_fastpath(a20addr, BX_READ);
+    if (BX_LIKELY(direct != NULL)) {
+      if (len == 4) {
+        *(Bit32u*)data = ReadHostDWordFromLittleEndian((Bit32u*)direct);
+      } else if (len == 8) {
+        *(Bit64u*)data = ReadHostQWordFromLittleEndian((Bit64u*)direct);
+      } else if (len == 2) {
+        *(Bit16u*)data = ReadHostWordFromLittleEndian((Bit16u*)direct);
+      } else if (len == 1) {
+        *(Bit8u*)data = *direct;
+      } else {
+        memcpy(data, direct, len);
+      }
+      return;
+    }
+  }
+#endif // BX_WASM_DIRECT_RAM_FASTPATH
 
   bool is_bios = (a20addr >= (bx_phy_address)BX_MEM_THIS bios_rom_addr);
 #if BX_PHY_ADDRESS_LONG
