@@ -1,0 +1,5 @@
+# Compiled test binaries
+test_server
+test_http
+test_http_minimal
+*.o
