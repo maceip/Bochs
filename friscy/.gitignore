@@ -2,8 +2,11 @@
 build/
 build-native/
 
-# Downloaded dependencies
-src/
+# Downloaded dependencies (libriscv)
+/src/
+
+# But keep rv2wasm source
+!rv2wasm/src/
 
 # Go artifacts
 host_proxy/go.sum

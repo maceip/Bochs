@@ -18,215 +18,335 @@
 
 ---
 
-## Current Status (What's Built)
+## Project Status Overview
 
-### ✅ Core Emulator
-| Component | Status | Location |
-|-----------|--------|----------|
-| libriscv RV64GC emulator | ✅ Working | `src/libriscv/` |
-| Threaded dispatch (computed goto) | ✅ Enabled | CMakeLists.txt |
-| Encompassing arena (512MB) | ✅ Configured | 29-bit arena |
-| Emscripten build harness | ✅ Working | `harness.sh` |
-| Native build (for testing) | ✅ Working | `build-native/` |
+| Component | Status | Performance | Location |
+|-----------|--------|-------------|----------|
+| libriscv Interpreter | ✅ Complete | ~40% native | `src/libriscv/` |
+| Syscall Emulation | ✅ ~50 syscalls | N/A | `syscalls.hpp` |
+| Virtual Filesystem | ✅ Complete | N/A | `vfs.hpp` |
+| Dynamic Linker | ✅ Complete | N/A | `elf_loader.hpp`, `main.cpp` |
+| Networking | ✅ Complete | N/A | `network.hpp`, `host_proxy/` |
+| friscy-pack CLI | ✅ Complete | N/A | `friscy-pack` |
+| **rv2wasm AOT** | 🟡 70% Done | 5-20x speedup | `rv2wasm/src/` |
+| Wizer Snapshots | ⬜ Not Started | 2-5x startup | N/A |
+| Browser Terminal | 🟡 Partial | N/A | `network_bridge.js` |
 
-### ✅ Syscall Emulation (~50 syscalls)
-| Category | Syscalls | Status |
-|----------|----------|--------|
-| Process | exit, getpid, getuid, gettid | ✅ |
-| Memory | brk, mmap, munmap, mprotect | ✅ (basic) |
-| Files | open, close, read, write, lseek, stat | ✅ |
-| Dirs | getdents64, getcwd, chdir | ✅ |
-| Time | clock_gettime, getrandom | ✅ |
-| I/O | ioctl, fcntl, writev | ✅ |
-| **Network** | socket, connect, send, recv, close | ✅ **NEW** |
-
-### ✅ Virtual Filesystem
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Tar archive loading | ✅ | Embedded or fetched |
-| Directory tree | ✅ | In-memory |
-| File read | ✅ | From tar content |
-| Symlink resolution | ✅ | Basic |
-| getdents64 | ✅ | For `ls`, `find` |
-
-### ✅ Networking (Just Completed!)
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Socket syscalls | ✅ | socket, connect, send, recv |
-| Native sockets | ✅ | Real TCP/UDP in native builds |
-| WebSocket bridge | ✅ | `network_bridge.js` for browser |
-| Host proxy | ✅ | `host_proxy/main.go` |
-| HTTP fetch test | ✅ | `tests/test_http_minimal.c` |
-
-### ✅ Documentation
-- `ARCHITECTURE.md` - System design
-- `PERFORMANCE_ROADMAP.md` - This document
+**Legend**: ✅ Complete | 🟡 In Progress | ⬜ Not Started
 
 ---
 
-## What's Missing (Build Order)
+## What Works Today
 
-### ✅ Phase 1: End-to-End Pipeline (DONE)
-
-**Goal**: User runs one command, gets working Wasm bundle.
+### Running RISC-V Binaries (Native)
 
 ```bash
-# Usage:
-$ friscy-pack myimage:latest --output bundle/
+# Build the interpreter
+cd friscy
+mkdir build-native && cd build-native
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
 
-# Output:
-bundle/
-├── friscy.wasm          # Emulator compiled to Wasm
-├── friscy.js            # Emscripten glue
-├── rootfs.tar           # Container filesystem
-├── index.html           # Demo page with xterm.js
-└── manifest.json        # Entrypoint, env, workdir
+# Run a static binary
+riscv64-linux-gnu-gcc -static -o hello hello.c
+./friscy hello
+
+# Run with container rootfs
+./friscy --rootfs alpine-rootfs.tar /bin/busybox ls -la
 ```
 
-**Completed Tasks**:
-| Task | Status |
-|------|--------|
-| Create `friscy-pack` CLI tool | ✅ `friscy-pack` |
-| Extract Docker rootfs | ✅ Works with --platform linux/riscv64 |
-| Generate index.html with terminal | ✅ xterm.js + WebSocket bridge |
-| Bundle manifest (entrypoint, args, env) | ✅ JSON manifest |
-| Optional `--aot` flag for AOT compilation | ✅ Skeleton (needs rv2wasm) |
-
-**Location**: `friscy-pack` (executable shell script)
-
----
-
-### ✅ Phase 2: Dynamic Linker Support (DONE)
-
-**Problem**: Most Docker containers use dynamically linked binaries.
+### Building for WebAssembly
 
 ```bash
-$ file /bin/busybox  # Alpine
-/bin/busybox: ELF 64-bit LSB pie executable, UCB RISC-V, ... dynamically linked,
-interpreter /lib/ld-musl-riscv64.so.1
+# Requires Docker with Emscripten image
+./harness.sh
+# Output: build/friscy.wasm, build/friscy.js
 ```
 
-**Solution**: Support the dynamic linker (ld-musl).
+### Testing Networking
 
-**Completed Tasks**:
-| Task | Status | Location |
-|------|--------|----------|
-| Parse ELF PT_INTERP | ✅ | `elf_loader.hpp` |
-| Load ld-musl as entry point | ✅ | `main.cpp` |
-| Build aux vector (AT_PHDR, AT_ENTRY, etc.) | ✅ | `elf_loader.hpp` dynlink namespace |
-| Load interpreter at 0x40000000 | ✅ | `main.cpp` |
-| Jump to interpreter entry | ✅ | `main.cpp` |
+```bash
+# Terminal 1: Start test server
+python3 tests/test_server.py 8080
 
-**How it works**:
+# Terminal 2: Run network test
+./friscy tests/test_http_minimal
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Dynamic Binary: /bin/python3                                    │
-│                                                                  │
-│  1. friscy reads ELF, finds PT_INTERP = /lib/ld-musl-riscv64.so │
-│  2. friscy loads interpreter at 0x40000000                       │
-│  3. friscy sets up stack with aux vector:                        │
-│     AT_PHDR = address of python3's program headers              │
-│     AT_PHNUM = number of program headers                         │
-│     AT_ENTRY = python3's entry point                             │
-│     AT_BASE = interpreter load address (0x40000000)             │
-│     AT_RANDOM, AT_PLATFORM, AT_HWCAP, etc.                      │
-│  4. friscy jumps to interpreter entry point                      │
-│  5. ld-musl runs, reads auxv, loads libc.so, etc.               │
-│  6. ld-musl jumps to python3's entry point                      │
-│  7. Python runs normally                                         │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Remaining**: Test with real Alpine containers
 
 ---
 
-### 🟡 Phase 3: Wizer Snapshots (2-5x startup improvement)
+## Priority 1: Complete rv2wasm AOT Compiler
 
-**Problem**: Parsing tar + loading ELF on every page load is slow.
+**Impact**: 5-20x performance improvement
 
-**Solution**: Snapshot initialized state into Wasm using Wizer.
+The rv2wasm compiler translates RISC-V binaries to native WebAssembly at build time, eliminating interpretation overhead.
+
+### Current Status
+
+| Component | Status | File | Notes |
+|-----------|--------|------|-------|
+| CLI Interface | ✅ Done | `rv2wasm/src/main.rs` | Parses args, orchestrates pipeline |
+| ELF Parsing | ✅ Done | `rv2wasm/src/elf.rs` | Uses `goblin` crate |
+| Disassembler | ✅ Done | `rv2wasm/src/disasm.rs` | 80+ RV64GC opcodes |
+| CFG Builder | ✅ Done | `rv2wasm/src/cfg.rs` | Basic blocks, functions |
+| Wasm IR | ✅ Done | `rv2wasm/src/translate.rs` | Core integer ops |
+| Wasm Output | ✅ Done | `rv2wasm/src/wasm_builder.rs` | Uses `wasm-encoder` |
+| Dispatch Loop | 🟡 Basic | `rv2wasm/src/wasm_builder.rs:90` | Needs br_table |
+| Float Ops | ⬜ Stubs | `rv2wasm/src/disasm.rs:90` | FLW/FSW/FADD etc |
+| Atomics | ⬜ Stubs | `rv2wasm/src/disasm.rs:120` | LR/SC/AMO* |
+| Integration | ⬜ Not started | `friscy-pack` | --aot flag |
+
+### TODO: Dispatch Loop Optimization
+
+**Where**: `rv2wasm/src/wasm_builder.rs` line 90-150
+
+**Problem**: Current dispatch uses linear function calls. Need `br_table` for O(1) dispatch.
+
+**How to fix**:
+```rust
+// In build_dispatch_function(), replace linear calls with:
+// 1. Build table of (pc_address, function_index) pairs
+// 2. Normalize PC to table index: (pc - base_addr) / 4
+// 3. Use br_table to jump to correct block
+
+func.instruction(&Instruction::LocalGet(2)); // $pc
+func.instruction(&Instruction::I32Const(base_addr));
+func.instruction(&Instruction::I32Sub);
+func.instruction(&Instruction::I32Const(4));
+func.instruction(&Instruction::I32DivU);
+func.instruction(&Instruction::BrTable(block_targets, default_target));
+```
+
+### TODO: Floating-Point Translation
+
+**Where**: `rv2wasm/src/translate.rs`
+
+**Problem**: F/D extension instructions are defined in disasm.rs but not translated.
+
+**How to fix**:
+```rust
+// Add cases to translate_instruction() for:
+Opcode::FADD_S => {
+    // Wasm has f32.add, maps directly
+    body.push(WasmInst::F32Load { offset: rs1_offset });
+    body.push(WasmInst::F32Load { offset: rs2_offset });
+    body.push(WasmInst::F32Add);
+    body.push(WasmInst::F32Store { offset: rd_offset });
+}
+// FP registers could share space with integer regs or use separate offsets
+```
+
+### TODO: Atomics Translation
+
+**Where**: `rv2wasm/src/translate.rs`
+
+**Problem**: LR/SC (load-reserved/store-conditional) need Wasm atomics or fallback.
+
+**How to fix**:
+```rust
+// Option 1: Use Wasm atomics (requires SharedArrayBuffer)
+Opcode::LR_D => {
+    // atomic.load + reservation tracking
+}
+Opcode::SC_D => {
+    // Compare reservation, atomic.cmpxchg
+}
+
+// Option 2: Single-threaded fallback (simpler)
+Opcode::LR_D => {
+    // Just load, set reservation flag
+    body.push(WasmInst::I64Load { ... });
+    // Store reservation address in global
+}
+```
+
+### TODO: friscy-pack Integration
+
+**Where**: `friscy-pack` (shell script, line ~150)
+
+**How to fix**:
+```bash
+# In friscy-pack, after extracting rootfs:
+if [ "$AOT" = "true" ]; then
+    # Find all ELF binaries in rootfs
+    find "$ROOTFS" -type f -executable | while read elf; do
+        if file "$elf" | grep -q "RISC-V"; then
+            rv2wasm "$elf" -o "${elf}.wasm"
+        fi
+    done
+    # Generate Wasm module that links all blocks
+fi
+```
+
+### Building rv2wasm
+
+```bash
+cd rv2wasm
+cargo build --release
+./target/release/rv2wasm input.elf -o output.wasm --verbose
+```
+
+---
+
+## Priority 2: Test Dynamic Linking with Real Containers
+
+**Impact**: Validates the whole stack works
+
+### Current Status
+- ✅ ELF PT_INTERP detection
+- ✅ Interpreter loading at 0x40000000
+- ✅ Auxiliary vector setup
+- ⬜ Real container testing
+
+### TODO: Alpine busybox Test
+
+**Where**: `main.cpp`, command line
+
+**How to test**:
+```bash
+# 1. Get Alpine RISC-V rootfs
+docker create --platform linux/riscv64 alpine:latest
+docker export <container_id> > alpine.tar
+
+# 2. Run busybox
+./friscy --rootfs alpine.tar /bin/busybox ls -la
+
+# 3. If it fails, check:
+#    - Are all required .so files in the tar?
+#    - Is ld-musl-riscv64.so.1 present?
+#    - Debug with: ./friscy --rootfs alpine.tar /bin/busybox 2>&1 | head -50
+```
+
+### TODO: Python Test
+
+**How to test**:
+```bash
+# Python is a good stress test - lots of dynamic loading
+./friscy --rootfs python-riscv64.tar /usr/bin/python3 -c "print('hello')"
+
+# Common issues:
+# - Missing libpython3.so
+# - Missing standard library modules
+# - Syscall not implemented (check stderr)
+```
+
+### Debugging Dynamic Linking
+
+Add verbose output to `main.cpp`:
+```cpp
+// Around line 220
+std::cout << "[friscy] Loading segment at 0x" << std::hex << vaddr << std::dec << "\n";
+std::cout << "[friscy] Interpreter entry: 0x" << std::hex << interp_entry << std::dec << "\n";
+```
+
+---
+
+## Priority 3: Wizer Snapshots
+
+**Impact**: 2-5x faster startup
+
+### Current Status
+- ⬜ Not started
+
+### What Needs to Be Done
+
+**Where**: `main.cpp`, `CMakeLists.txt`
+
+**Step 1**: Add wizer_init export
+```cpp
+// main.cpp - add before main()
+#ifdef FRISCY_WIZER
+extern "C" void wizer_init() {
+    // Parse rootfs.tar (embedded or from stdin)
+    // Build VFS tree
+    // Load ELF headers
+    // Initialize machine state
+    // Do NOT start execution
+}
+#endif
+```
+
+**Step 2**: Enable in CMakeLists.txt
+```cmake
+if(FRISCY_WIZER)
+    list(APPEND FRISCY_LINK_FLAGS
+        -sEXPORTED_FUNCTIONS=['_main','_wizer_init']
+    )
+endif()
+```
+
+**Step 3**: Run Wizer in build pipeline
+```bash
+# In harness.sh or friscy-pack
+wizer --allow-wasi --wasm-bulk-memory true \
+    friscy.wasm -o friscy-snapshot.wasm \
+    --init-func wizer_init
+```
+
+---
+
+## File Reference
 
 ```
-Build time:                          Runtime:
-┌─────────┐    ┌─────────┐          ┌────────────────┐
-│ friscy  │───▶│  Wizer  │    ───▶  │ Instant start! │
-│  .wasm  │    │         │          │ (pre-warmed)   │
-└─────────┘    └─────────┘          └────────────────┘
-                   │
-           Runs initialization:
-           - Parse rootfs.tar
-           - Build VFS tree
-           - Load ELF headers
-           - Setup memory layout
-           - SNAPSHOT!
+friscy/
+├── main.cpp                 # Entry point, machine setup, dynamic linker
+│                            # Key functions:
+│                            #   - main(): CLI parsing, orchestration
+│                            #   - load_from_vfs(): Load binary from tar
+│                            #   - setup_virtual_files(): /dev, /proc emulation
+│
+├── syscalls.hpp             # Linux syscall emulation (~50 syscalls)
+│                            # Key namespaces:
+│                            #   - syscalls::nr:: syscall numbers
+│                            #   - syscalls::handlers:: handler functions
+│                            #   - syscalls::install_syscalls(): registers all
+│
+├── vfs.hpp                  # Virtual filesystem from tar
+│                            # Key classes:
+│                            #   - VirtualFS: main filesystem class
+│                            #   - Entry: file/directory node
+│                            #   - FileHandle/DirHandle: open file state
+│
+├── elf_loader.hpp           # ELF parsing + dynamic linker support
+│                            # Key namespaces:
+│                            #   - elf:: ELF structures and parsing
+│                            #   - dynlink:: auxiliary vector setup
+│
+├── network.hpp              # Socket syscalls (native + Wasm)
+│                            # Key functions:
+│                            #   - net::install_network_syscalls()
+│                            #   - sys_socket, sys_connect, sys_sendto, etc.
+│
+├── network_bridge.js        # Browser WebSocket ↔ socket bridge
+├── host_proxy/main.go       # Host-side WebSocket → real sockets
+│
+├── friscy-pack              # CLI tool: Docker image → browser bundle
+│                            # Usage: friscy-pack myimage:latest --output bundle/
+│
+├── harness.sh               # Docker-based Emscripten build
+├── CMakeLists.txt           # Build configuration with all options
+│
+├── rv2wasm/                 # RISC-V → Wasm AOT compiler
+│   ├── Cargo.toml           # Rust dependencies
+│   ├── README.md            # Build and usage instructions
+│   └── src/
+│       ├── main.rs          # CLI: rv2wasm input.elf -o output.wasm
+│       ├── lib.rs           # Library entry: compile(elf_data, opt, debug)
+│       ├── elf.rs           # ELF parsing with goblin
+│       ├── disasm.rs        # RV64GC disassembler (80+ opcodes)
+│       ├── cfg.rs           # Control flow graph construction
+│       ├── translate.rs     # RISC-V → Wasm IR translation
+│       └── wasm_builder.rs  # Wasm binary generation
+│
+├── tests/
+│   ├── test_http_minimal.c  # HTTP client test
+│   ├── test_server.py       # Simple HTTP server
+│   └── run_network_test.sh  # Automated test script
+│
+├── ARCHITECTURE.md          # System design document
+├── PERFORMANCE_ROADMAP.md   # This file
+└── CRAZY_PERF_IDEAS.md      # Advanced optimization strategies
 ```
-
-**Tasks**:
-| Task | Effort | Priority |
-|------|--------|----------|
-| Add `wizer_init()` export | Low | 🟡 |
-| Run Wizer in build pipeline | Medium | 🟡 |
-| Test with various container sizes | Medium | 🟡 |
-
----
-
-### 🟡 Phase 4: Terminal Integration
-
-**Problem**: Need interactive terminal in browser.
-
-**Solution**: Integrate xterm.js with stdin/stdout.
-
-**Tasks**:
-| Task | Effort | Priority |
-|------|--------|----------|
-| xterm.js integration | Low | 🟡 |
-| stdin from keyboard | Low | 🟡 |
-| stdout/stderr to terminal | ✅ Done | via write syscall |
-| ANSI escape handling | ✅ Done | xterm.js handles |
-| Window resize (TIOCGWINSZ) | ✅ Done | ioctl returns 80x24 |
-
----
-
-### 🟡 Phase 5: Persistent Storage
-
-**Problem**: Container state lost on page reload.
-
-**Solution**: Use IndexedDB or OPFS for persistence.
-
-**Tasks**:
-| Task | Effort | Priority |
-|------|--------|----------|
-| Identify writable directories | Low | 🟡 |
-| Sync writes to IndexedDB | Medium | 🟡 |
-| Restore state on reload | Medium | 🟡 |
-| OPFS for large files | Medium | 🟡 |
-
----
-
-### 🟢 Phase 6: Performance Optimization
-
-**Current**: Working but not optimized.
-
-**Tasks**:
-| Task | Effort | Impact |
-|------|--------|--------|
-| -O3 -flto builds | Low | 10-20% |
-| WASM SIMD (-msimd128) | Low | 5-10% |
-| Bulk memory ops | Low | Faster memcpy |
-| Inline hot syscalls | Medium | 10-20% |
-| Lazy VFS (don't load full tar) | High | Faster startup |
-
----
-
-### 🟢 Phase 7: Advanced Features
-
-| Feature | Effort | Notes |
-|---------|--------|-------|
-| Multi-threading (WebWorkers) | High | For parallel workloads |
-| GPU compute (WebGPU) | High | For ML/compute containers |
-| Audio (Web Audio API) | Medium | For multimedia |
-| Clipboard access | Low | Copy/paste support |
 
 ---
 
@@ -234,133 +354,76 @@ Build time:                          Runtime:
 
 | Feature | WebVM | container2wasm | v86 | **friscy** |
 |---------|-------|----------------|-----|------------|
-| ISA | x86 (JIT) | x86 (Bochs) | x86 (JIT) | RISC-V (interp) |
+| ISA | x86 (JIT) | x86 (Bochs) | x86 (JIT) | RISC-V (interp/AOT) |
 | Boot time | 3-5s | 30-60s | 5-10s | **<500ms** |
 | Kernel | Yes | Yes | Yes | **No (userland)** |
 | Dynamic linking | Yes | Yes | Yes | **Yes** |
 | Networking | Yes | Limited | Yes | **Yes** |
 | Open source | No | Yes | Yes | **Yes** |
-| CoreMark % | ~15% | ~1% | ~10% | **~40%** |
-| AOT compiler | No | No | No | **Skeleton** |
+| Interpreted perf | ~15% | ~1% | ~10% | **~40%** |
+| AOT perf | No | No | No | **~80% (target)** |
 
 **Why friscy wins**:
 1. **No kernel** = instant start, smaller Wasm
-2. **RISC-V** = simpler ISA, faster interpreter
-3. **Pre-compiled** = Emscripten optimizes, no runtime JIT
-4. **Wizer** = snapshot initialization for instant warm start
+2. **RISC-V** = simpler ISA (47 base opcodes vs 1500+ x86)
+3. **AOT compilation** = native Wasm speed
+4. **Wizer snapshots** = instant warm start
 
 ---
 
-## Implementation Priority
+## Next Steps (In Order)
 
-```
-Week 1-2: End-to-End Pipeline
-├── friscy-pack CLI tool
-├── Auto RISC-V build
-├── Bundle generation
-└── Demo page with xterm.js
+### This Week
+1. ⬜ Build and test rv2wasm with simple RISC-V binary
+2. ⬜ Test Alpine busybox with dynamic linker
+3. ⬜ Fix any missing syscalls discovered in testing
 
-Week 3-4: Dynamic Linking
-├── Load ld-musl as entry
-├── Aux vector setup
-├── mmap PROT_EXEC
-└── Test Alpine busybox, Python
+### Next Week
+4. ⬜ Implement br_table dispatch in rv2wasm
+5. ⬜ Add floating-point translation
+6. ⬜ Integrate rv2wasm with friscy-pack --aot
 
-Week 5: Polish
-├── Wizer integration
-├── Performance tuning
-├── Documentation
-└── Demo containers (Python, Node, etc.)
-```
+### Following Week
+7. ⬜ Implement Wizer snapshot support
+8. ⬜ End-to-end test: Docker → browser with AOT
+9. ⬜ Performance benchmarks vs WebVM
 
 ---
 
-## Quick Start (What Works Today)
+## Contributing
+
+### Setting Up Development Environment
 
 ```bash
-# 1. Build friscy (native, for testing)
-cd friscy
+# Clone
+git clone https://github.com/maceip/Bochs.git
+cd Bochs/friscy
+
+# Build native (for testing)
 mkdir build-native && cd build-native
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+make -j$(nproc)
 
-# 2. Compile a static RISC-V binary
-riscv64-linux-gnu-gcc -static -o hello hello.c
+# Build rv2wasm (requires Rust)
+cd ../rv2wasm
+cargo build
 
-# 3. Run it
-./friscy hello
-
-# 4. Test networking
-python3 tests/test_server.py 8080 &
-./friscy tests/test_http_minimal
-# → Makes real HTTP request!
-
-# 5. Build for Wasm (requires Docker)
-./harness.sh
-# → Produces build/friscy.wasm
+# Run tests
+cd ..
+./tests/run_network_test.sh
 ```
 
----
+### Code Style
+- C++20 for interpreter code
+- Rust 2021 edition for rv2wasm
+- Markdown for documentation
+- No trailing whitespace
 
-## Files Reference
+### Testing Changes
+```bash
+# Always test with a simple binary first
+./build-native/friscy tests/hello
 
+# Then test with a container
+./build-native/friscy --rootfs alpine.tar /bin/busybox echo "hello"
 ```
-friscy/
-├── main.cpp                 # Entry point, machine setup, dynamic linker
-├── vfs.hpp                  # Virtual filesystem
-├── syscalls.hpp             # ~50 Linux syscalls
-├── network.hpp              # Socket syscalls (TCP/UDP)
-├── network_bridge.js        # Browser WebSocket bridge
-├── elf_loader.hpp           # ELF parsing, aux vector, dynlink namespace
-├── CMakeLists.txt           # Build configuration
-├── harness.sh               # Docker-based Wasm build
-├── friscy-pack              # CLI tool: Docker → browser bundle
-├── host_proxy/              # Host-side network proxy
-│   ├── main.go              # WebSocket → real sockets
-│   └── go.mod
-├── rv2wasm/                 # RISC-V → Wasm AOT compiler (Rust)
-│   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs          # CLI entry point
-│       ├── elf.rs           # ELF parsing
-│       ├── disasm.rs        # RISC-V disassembler
-│       ├── cfg.rs           # Control flow graph
-│       ├── translate.rs     # RISC-V → Wasm translation
-│       └── wasm_builder.rs  # Wasm module construction
-├── tests/
-│   ├── test_http_minimal.c  # Networking test
-│   ├── test_server.py       # HTTP test server
-│   └── run_network_test.sh  # Automated test
-├── ARCHITECTURE.md          # Design document
-├── PERFORMANCE_ROADMAP.md   # This file
-└── CRAZY_PERF_IDEAS.md      # Advanced performance optimizations
-```
-
----
-
-## Summary
-
-**Done**:
-- Core RISC-V emulation (libriscv)
-- Basic syscall set (~50)
-- Virtual filesystem from tar
-- Networking (socket, connect, send, recv)
-- Native + Wasm builds
-- **friscy-pack CLI** - Bundle Docker containers
-- **Dynamic linker support** - Load ld-musl, aux vector setup
-- **rv2wasm skeleton** - AOT compiler framework (Rust)
-
-**Pre-Launch Priority** (AOT is the target):
-1. **Complete rv2wasm** - RISC-V → Wasm AOT compilation (5-20x speedup!)
-   - Finish instruction translation (~47 RISC-V opcodes)
-   - Handle syscall trampolines
-   - Integrate with friscy-pack `--aot` flag
-2. **Test dynamic linking** - Run real Alpine busybox, Python containers
-3. **Wizer integration** - Instant startup via pre-initialization
-
-**Post-Launch**:
-4. Performance tuning - Profile and optimize hot paths
-5. Persistent storage - IndexedDB/OPFS
-6. Advanced networking - gvisor-tap-vsock
-
-**Then we beat WebVM by 5-10x** 🚀
