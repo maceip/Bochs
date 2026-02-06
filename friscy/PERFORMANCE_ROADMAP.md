@@ -66,12 +66,12 @@
 
 ## What's Missing (Build Order)
 
-### 🔴 Phase 1: End-to-End Pipeline (CRITICAL)
+### ✅ Phase 1: End-to-End Pipeline (DONE)
 
 **Goal**: User runs one command, gets working Wasm bundle.
 
 ```bash
-# What we need:
+# Usage:
 $ friscy-pack myimage:latest --output bundle/
 
 # Output:
@@ -79,61 +79,24 @@ bundle/
 ├── friscy.wasm          # Emulator compiled to Wasm
 ├── friscy.js            # Emscripten glue
 ├── rootfs.tar           # Container filesystem
-├── index.html           # Demo page
-└── manifest.json        # Entrypoint, env, etc.
+├── index.html           # Demo page with xterm.js
+└── manifest.json        # Entrypoint, env, workdir
 ```
 
-**Tasks**:
-| Task | Effort | Priority |
-|------|--------|----------|
-| Create `friscy-pack` CLI tool | Medium | 🔴 |
-| Auto-detect/build RISC-V container | Medium | 🔴 |
-| Generate index.html with terminal | Low | 🔴 |
-| Bundle manifest (entrypoint, args, env) | Low | 🔴 |
+**Completed Tasks**:
+| Task | Status |
+|------|--------|
+| Create `friscy-pack` CLI tool | ✅ `friscy-pack` |
+| Extract Docker rootfs | ✅ Works with --platform linux/riscv64 |
+| Generate index.html with terminal | ✅ xterm.js + WebSocket bridge |
+| Bundle manifest (entrypoint, args, env) | ✅ JSON manifest |
+| Optional `--aot` flag for AOT compilation | ✅ Skeleton (needs rv2wasm) |
 
-**Implementation**:
-```bash
-#!/bin/bash
-# friscy-pack (sketch)
-IMAGE=$1
-OUTPUT=$2
-
-# 1. Build for RISC-V if not already
-docker buildx build --platform linux/riscv64 -t ${IMAGE}-riscv64 .
-
-# 2. Export rootfs
-docker create --platform linux/riscv64 --name temp ${IMAGE}-riscv64
-docker export temp > ${OUTPUT}/rootfs.tar
-ENTRYPOINT=$(docker inspect temp --format '{{json .Config.Entrypoint}}')
-docker rm temp
-
-# 3. Copy pre-built friscy.wasm
-cp /opt/friscy/friscy.wasm ${OUTPUT}/
-cp /opt/friscy/friscy.js ${OUTPUT}/
-
-# 4. Generate manifest
-echo "{\"entrypoint\": $ENTRYPOINT}" > ${OUTPUT}/manifest.json
-
-# 5. Generate index.html
-cat > ${OUTPUT}/index.html << 'EOF'
-<!DOCTYPE html>
-<html>
-<head><title>friscy container</title></head>
-<body>
-<div id="terminal"></div>
-<script src="https://unpkg.com/xterm@5.3.0/lib/xterm.min.js"></script>
-<script src="friscy.js"></script>
-<script>
-  // Initialize terminal and friscy...
-</script>
-</body>
-</html>
-EOF
-```
+**Location**: `friscy-pack` (executable shell script)
 
 ---
 
-### 🔴 Phase 2: Dynamic Linker Support (CRITICAL for real containers)
+### ✅ Phase 2: Dynamic Linker Support (DONE)
 
 **Problem**: Most Docker containers use dynamically linked binaries.
 
@@ -143,18 +106,16 @@ $ file /bin/busybox  # Alpine
 interpreter /lib/ld-musl-riscv64.so.1
 ```
 
-**Current state**: friscy works with `-static` binaries only.
-
 **Solution**: Support the dynamic linker (ld-musl).
 
-**Tasks**:
-| Task | Effort | Priority |
+**Completed Tasks**:
+| Task | Status | Location |
 |------|--------|----------|
-| Parse ELF PT_INTERP | ✅ Done | `elf_loader.hpp` |
-| Load ld-musl as entry point | Medium | 🔴 |
-| Build aux vector (AT_PHDR, AT_ENTRY, etc.) | Medium | 🔴 |
-| mmap with PROT_EXEC | Medium | 🔴 |
-| Let musl handle .so loading | Low | 🔴 |
+| Parse ELF PT_INTERP | ✅ | `elf_loader.hpp` |
+| Load ld-musl as entry point | ✅ | `main.cpp` |
+| Build aux vector (AT_PHDR, AT_ENTRY, etc.) | ✅ | `elf_loader.hpp` dynlink namespace |
+| Load interpreter at 0x40000000 | ✅ | `main.cpp` |
+| Jump to interpreter entry | ✅ | `main.cpp` |
 
 **How it works**:
 ```
@@ -162,17 +123,21 @@ interpreter /lib/ld-musl-riscv64.so.1
 │  Dynamic Binary: /bin/python3                                    │
 │                                                                  │
 │  1. friscy reads ELF, finds PT_INTERP = /lib/ld-musl-riscv64.so │
-│  2. friscy loads ld-musl instead of python3                     │
-│  3. friscy sets up aux vector:                                   │
+│  2. friscy loads interpreter at 0x40000000                       │
+│  3. friscy sets up stack with aux vector:                        │
 │     AT_PHDR = address of python3's program headers              │
 │     AT_PHNUM = number of program headers                         │
 │     AT_ENTRY = python3's entry point                             │
-│     AT_BASE = ld-musl load address                              │
-│  4. ld-musl runs, loads libc.so, libpython.so, etc.             │
-│  5. ld-musl jumps to python3's entry point                      │
-│  6. Python runs normally                                         │
+│     AT_BASE = interpreter load address (0x40000000)             │
+│     AT_RANDOM, AT_PLATFORM, AT_HWCAP, etc.                      │
+│  4. friscy jumps to interpreter entry point                      │
+│  5. ld-musl runs, reads auxv, loads libc.so, etc.               │
+│  6. ld-musl jumps to python3's entry point                      │
+│  7. Python runs normally                                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**Remaining**: Test with real Alpine containers
 
 ---
 
@@ -272,10 +237,11 @@ Build time:                          Runtime:
 | ISA | x86 (JIT) | x86 (Bochs) | x86 (JIT) | RISC-V (interp) |
 | Boot time | 3-5s | 30-60s | 5-10s | **<500ms** |
 | Kernel | Yes | Yes | Yes | **No (userland)** |
-| Dynamic linking | Yes | Yes | Yes | **WIP** |
+| Dynamic linking | Yes | Yes | Yes | **Yes** |
 | Networking | Yes | Limited | Yes | **Yes** |
 | Open source | No | Yes | Yes | **Yes** |
 | CoreMark % | ~15% | ~1% | ~10% | **~40%** |
+| AOT compiler | No | No | No | **Skeleton** |
 
 **Why friscy wins**:
 1. **No kernel** = instant start, smaller Wasm
@@ -340,23 +306,34 @@ python3 tests/test_server.py 8080 &
 
 ```
 friscy/
-├── main.cpp                 # Entry point, machine setup
+├── main.cpp                 # Entry point, machine setup, dynamic linker
 ├── vfs.hpp                  # Virtual filesystem
 ├── syscalls.hpp             # ~50 Linux syscalls
 ├── network.hpp              # Socket syscalls (TCP/UDP)
 ├── network_bridge.js        # Browser WebSocket bridge
-├── elf_loader.hpp           # ELF parsing, dynamic linking prep
+├── elf_loader.hpp           # ELF parsing, aux vector, dynlink namespace
 ├── CMakeLists.txt           # Build configuration
 ├── harness.sh               # Docker-based Wasm build
+├── friscy-pack              # CLI tool: Docker → browser bundle
 ├── host_proxy/              # Host-side network proxy
 │   ├── main.go              # WebSocket → real sockets
 │   └── go.mod
+├── rv2wasm/                 # RISC-V → Wasm AOT compiler (Rust)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs          # CLI entry point
+│       ├── elf.rs           # ELF parsing
+│       ├── disasm.rs        # RISC-V disassembler
+│       ├── cfg.rs           # Control flow graph
+│       ├── translate.rs     # RISC-V → Wasm translation
+│       └── wasm_builder.rs  # Wasm module construction
 ├── tests/
 │   ├── test_http_minimal.c  # Networking test
 │   ├── test_server.py       # HTTP test server
 │   └── run_network_test.sh  # Automated test
 ├── ARCHITECTURE.md          # Design document
-└── PERFORMANCE_ROADMAP.md   # This file
+├── PERFORMANCE_ROADMAP.md   # This file
+└── CRAZY_PERF_IDEAS.md      # Advanced performance optimizations
 ```
 
 ---
@@ -367,12 +344,23 @@ friscy/
 - Core RISC-V emulation (libriscv)
 - Basic syscall set (~50)
 - Virtual filesystem from tar
-- **Networking (socket, connect, send, recv)**
+- Networking (socket, connect, send, recv)
 - Native + Wasm builds
+- **friscy-pack CLI** - Bundle Docker containers
+- **Dynamic linker support** - Load ld-musl, aux vector setup
+- **rv2wasm skeleton** - AOT compiler framework (Rust)
 
-**Next**:
-1. **friscy-pack** - One command to bundle container
-2. **Dynamic linker** - Support real Alpine/Debian containers
-3. **Wizer** - Instant startup
+**Pre-Launch Priority** (AOT is the target):
+1. **Complete rv2wasm** - RISC-V → Wasm AOT compilation (5-20x speedup!)
+   - Finish instruction translation (~47 RISC-V opcodes)
+   - Handle syscall trampolines
+   - Integrate with friscy-pack `--aot` flag
+2. **Test dynamic linking** - Run real Alpine busybox, Python containers
+3. **Wizer integration** - Instant startup via pre-initialization
 
-**Then we beat WebVM** 🚀
+**Post-Launch**:
+4. Performance tuning - Profile and optimize hot paths
+5. Persistent storage - IndexedDB/OPFS
+6. Advanced networking - gvisor-tap-vsock
+
+**Then we beat WebVM by 5-10x** 🚀
