@@ -5,58 +5,57 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ============================================================================
-# libriscv configuration for Emscripten (wasm32) target
+# friscy: Docker container runner via libriscv → WebAssembly
 #
-# Key insights:
-#   - NO MEMORY64: libriscv emulates a 64-bit RISC-V *guest* on a 32-bit
-#     Wasm *host*. Guest 64-bit addresses are just uint64_t values in
-#     the host's 32-bit address space. The encompassing arena (28-bit =
-#     256MB) fits easily in wasm32. MEMORY64 is experimental, breaks JS
-#     glue code, and provides zero benefit here.
+# Goal: Beat WebVM/CheerpX performance through:
+#   1. Simple ISA (RISC-V vs x86) = efficient interpreter
+#   2. Pre-compiled Wasm (Emscripten LLVM) vs runtime JIT
+#   3. Threaded dispatch (computed goto) = ~40-50% native perf
+#   4. Wizer snapshots = instant startup
+#   5. No kernel boot (userland emulation)
 #
-#   - NO TAIL CALLS: The Wasm tail call proposal is separate from
-#     libriscv's [[clang::musttail]] dispatch. -mtail-call tells emcc
-#     to emit Wasm return_call instructions, but libriscv's tailcall
-#     dispatch uses a C++ attribute that doesn't map to Wasm tail calls.
-#     The official Wasm build uses threaded dispatch (computed goto)
-#     which works fine in Emscripten.
-#
-#   - NO BINARY TRANSLATION: Requires dlopen() and native code execution.
-#     Impossible in Wasm. Must be explicitly disabled.
-#
-#   - EXCEPTIONS REQUIRED: libriscv uses C++ throw/catch throughout.
-#     Emscripten must be told to support them with -fexceptions.
-#
-# Based on: libriscv/examples/wasm/build.sh (the official working config)
+# Key configuration decisions (see PERFORMANCE_ROADMAP.md):
+#   - NO MEMORY64: Guest 64-bit addrs are uint64_t in 32-bit host space
+#   - NO TAIL CALLS: Wasm return_call != libriscv's musttail dispatch
+#   - NO BINARY TRANSLATION: No dlopen in Wasm
+#   - YES EXCEPTIONS: libriscv uses throw/catch
+#   - THREADED DISPATCH: Fastest interpreter mode
+#   - ENCOMPASSING ARENA: O(1) memory access, 256MB guest space
 # ============================================================================
 
+option(FRISCY_WIZER "Enable Wizer pre-initialization support" OFF)
+option(FRISCY_PRODUCTION "Production build with maximum optimization" OFF)
+
 # --- Core ISA ---
-set(RISCV_32I OFF CACHE BOOL "Disable 32-bit RISC-V (we only need 64-bit)")
-set(RISCV_64I ON  CACHE BOOL "Enable 64-bit RISC-V")
-set(RISCV_EXT_A ON  CACHE BOOL "Enable Atomics extension")
-set(RISCV_EXT_C ON  CACHE BOOL "Enable Compressed instructions")
-set(RISCV_EXT_V OFF CACHE BOOL "Disable Vector extension (complex, not needed)")
+set(RISCV_32I OFF CACHE BOOL "")
+set(RISCV_64I ON  CACHE BOOL "")
+set(RISCV_EXT_A ON  CACHE BOOL "Atomics extension")
+set(RISCV_EXT_C ON  CACHE BOOL "Compressed instructions (2-byte opcodes)")
+set(RISCV_EXT_F ON  CACHE BOOL "Single-precision FP")
+set(RISCV_EXT_D ON  CACHE BOOL "Double-precision FP")
+set(RISCV_EXT_V OFF CACHE BOOL "Vector extension (complex, not needed)")
 set(RISCV_EXT_ZICOND OFF CACHE BOOL "")
 set(RISCV_EXT_ZMMUL  OFF CACHE BOOL "")
 set(RISCV_EXT_ZCMP   OFF CACHE BOOL "")
 
 # --- Dispatch mode ---
 # Threaded dispatch (computed goto) works in Emscripten and is fastest.
-# Switch-based is safer but ~30% slower. Tail call dispatch does NOT work.
-set(RISCV_THREADED ON  CACHE BOOL "Enable computed-goto threaded dispatch")
-set(RISCV_TAILCALL_DISPATCH OFF CACHE BOOL "DISABLED: musttail doesn't work in Wasm")
+# Provides ~30-40% speedup over switch-based dispatch.
+set(RISCV_THREADED ON  CACHE BOOL "Computed-goto threaded dispatch")
+set(RISCV_TAILCALL_DISPATCH OFF CACHE BOOL "musttail doesn't work in Wasm")
 
-# --- Memory ---
-# Encompassing arena allocates the full guest address space upfront.
-# 28-bit = 256MB, fits in wasm32's 4GB address space.
+# --- Memory configuration ---
+# Encompassing arena: pre-allocate full guest address space
+# 28-bit = 256MB, 29-bit = 512MB, 30-bit = 1GB
+# Larger arena = more containers supported, but higher memory baseline
 set(RISCV_ENCOMPASSING_ARENA ON  CACHE BOOL "Pre-allocate guest address space")
-set(RISCV_ENCOMPASSING_ARENA_BITS 28 CACHE STRING "256MB guest address space")
+set(RISCV_ENCOMPASSING_ARENA_BITS 29 CACHE STRING "512MB guest address space")
 set(RISCV_FLAT_RW_ARENA ON  CACHE BOOL "Fast read-write arena")
-set(RISCV_MEMORY_TRAPS OFF CACHE BOOL "Disable page traps (overhead for Wasm)")
+set(RISCV_MEMORY_TRAPS OFF CACHE BOOL "Disable page traps (overhead)")
 
-# --- Features to DISABLE for Wasm ---
-set(RISCV_BINARY_TRANSLATION OFF CACHE BOOL "DISABLED: requires dlopen/native code")
-set(RISCV_LIBTCC OFF CACHE BOOL "DISABLED: TCC compiler not available in Wasm")
+# --- Features to disable for Wasm ---
+set(RISCV_BINARY_TRANSLATION OFF CACHE BOOL "Requires dlopen/native code")
+set(RISCV_LIBTCC OFF CACHE BOOL "TCC not available in Wasm")
 set(RISCV_EXPERIMENTAL ON  CACHE BOOL "Enable experimental features")
 
 # --- Add libriscv ---
@@ -66,30 +65,79 @@ add_subdirectory(src/libriscv/lib)
 add_executable(friscy main.cpp)
 target_link_libraries(friscy PUBLIC riscv)
 
-# Include directories for our headers (vfs.hpp, syscalls.hpp)
+# Include directories for our headers
 target_include_directories(friscy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # --- Compile flags ---
-target_compile_options(friscy PRIVATE
-    -O2
-    -fexceptions          # CRITICAL: libriscv uses C++ exceptions everywhere
-)
+if(FRISCY_PRODUCTION)
+    # Maximum performance for production
+    target_compile_options(friscy PRIVATE
+        -O3
+        -flto
+        -fno-rtti
+        -fexceptions
+        -DNDEBUG
+        -msimd128              # WASM SIMD
+        -mbulk-memory          # Fast memcpy/memset
+        -mnontrapping-fptoint  # Faster FP conversions
+    )
+else()
+    # Development build
+    target_compile_options(friscy PRIVATE
+        -O2
+        -fexceptions
+    )
+endif()
 
 # --- Link flags ---
-target_link_options(friscy PRIVATE
-    -O2
+set(FRISCY_LINK_FLAGS
     -fexceptions
-    -sALLOW_TABLE_GROWTH  # Dynamic function table growth
-    -sINITIAL_MEMORY=268435456  # 256MB (matches 28-bit arena)
-    -sALLOW_MEMORY_GROWTH      # Allow growing beyond initial
-    -sMAXIMUM_MEMORY=536870912  # Cap at 512MB
+    -sALLOW_TABLE_GROWTH
+    -sINITIAL_MEMORY=536870912      # 512MB initial (matches 29-bit arena)
+    -sALLOW_MEMORY_GROWTH
+    -sMAXIMUM_MEMORY=2147483648     # 2GB max
+    -sSTACK_SIZE=1048576            # 1MB stack
     -sEXPORT_ES6=1
     -sMODULARIZE=1
-    -sEXPORTED_RUNTIME_METHODS=['FS','callMain']
-    -o friscy.js
+    -sEXPORTED_RUNTIME_METHODS=['FS','callMain','HEAPU8']
+    -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
 )
 
-# --- Optional: WASM SIMD ---
-# SIMD provides marginal benefit for interpreter workloads but doesn't hurt.
-# Uncomment if targeting modern browsers only:
-# target_compile_options(friscy PRIVATE -msimd128)
+if(FRISCY_PRODUCTION)
+    list(APPEND FRISCY_LINK_FLAGS
+        -O3
+        -flto
+        --closure=1                 # Minify JS glue
+        -sWASM_BIGINT               # Native i64 (faster)
+        -sENVIRONMENT=web,worker    # Strip Node.js code
+        -sSINGLE_FILE               # Embed Wasm in JS
+    )
+else()
+    list(APPEND FRISCY_LINK_FLAGS
+        -O2
+        -sASSERTIONS=1
+    )
+endif()
+
+# Wizer support for instant snapshots
+if(FRISCY_WIZER)
+    list(APPEND FRISCY_LINK_FLAGS
+        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_wizer_init']
+    )
+    target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
+endif()
+
+target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})
+
+# Output file
+set_target_properties(friscy PROPERTIES
+    OUTPUT_NAME "friscy"
+    SUFFIX ".js"
+)
+
+# --- Print configuration ---
+message(STATUS "friscy configuration:")
+message(STATUS "  Production build: ${FRISCY_PRODUCTION}")
+message(STATUS "  Wizer snapshots: ${FRISCY_WIZER}")
+message(STATUS "  Arena size: ${RISCV_ENCOMPASSING_ARENA_BITS} bits (${RISCV_ENCOMPASSING_ARENA_BITS})")
+message(STATUS "  Threaded dispatch: ${RISCV_THREADED}")
