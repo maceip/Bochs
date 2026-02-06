@@ -82,10 +82,12 @@ if(FRISCY_PRODUCTION)
         -mnontrapping-fptoint  # Faster FP conversions
     )
 else()
-    # Development build
+    # Development build - still enable SIMD for testing
     target_compile_options(friscy PRIVATE
         -O2
         -fexceptions
+        -msimd128              # WASM SIMD (2-4x faster memcpy)
+        -mbulk-memory          # Fast memcpy/memset intrinsics
     )
 endif()
 
@@ -93,6 +95,8 @@ endif()
 if(EMSCRIPTEN)
     set(FRISCY_LINK_FLAGS
         -fexceptions
+        -msimd128                       # WASM SIMD for faster memory ops
+        -mbulk-memory                   # memory.copy, memory.fill intrinsics
         -sALLOW_TABLE_GROWTH
         -sINITIAL_MEMORY=536870912      # 512MB initial (matches 29-bit arena)
         -sALLOW_MEMORY_GROWTH

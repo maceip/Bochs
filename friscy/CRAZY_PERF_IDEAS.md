@@ -94,7 +94,7 @@ as fast as true tail calls.
 
 ---
 
-### 3. Wasm SIMD for Memory Operations
+### 3. Wasm SIMD for Memory Operations ✅ ENABLED
 
 Bulk memory copies and fills are common (memcpy, memset, string ops).
 
@@ -108,7 +108,9 @@ v128_t* vsrc = (v128_t*)src;
 for (int i = 0; i < len/16; i++) vdst[i] = vsrc[i];
 ```
 
-**Emscripten flag:** `-msimd128`
+**Emscripten flags:** `-msimd128 -mbulk-memory`
+
+**STATUS: ENABLED** ✅ (added to CMakeLists.txt for both dev and production builds)
 
 **Expected speedup: 2-4x** for memory-heavy workloads
 
