@@ -5,13 +5,84 @@
 use crate::translate::{WasmInst, WasmModule};
 use anyhow::Result;
 use wasm_encoder::{
-    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    Instruction, MemorySection, MemoryType, Module, TableSection, TableType, TypeSection, ValType,
+    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+    FunctionSection, ImportSection, Instruction, MemoryType, Module, TableSection, TableType,
+    TypeSection, ValType,
 };
+
+/// Offset in linear memory where the PC→index dispatch mapping table is stored.
+/// Located right after the register file (x0-x31, 256 bytes).
+const DISPATCH_MAP_OFFSET: u32 = 256;
+
+/// Dispatch table metadata computed from block addresses.
+/// Maps PC values to dense function indices via a byte array in linear memory.
+struct DispatchTable {
+    /// Minimum block address (used to compute relative offset)
+    min_addr: u32,
+    /// The mapping table bytes: table[i] = function index for half-word offset i,
+    /// or `default_idx` if no block starts at that address.
+    data: Vec<u8>,
+    /// Number of block functions (also the default/invalid index for br_table)
+    num_functions: u32,
+}
+
+/// Build the dispatch table mapping PC → dense function index.
+///
+/// RISC-V instructions are either 2 bytes (compressed) or 4 bytes, so all
+/// block addresses are 2-byte aligned. We build a byte-indexed lookup table
+/// where `table[(pc - min_addr) / 2]` gives the br_table case index for that PC.
+/// Unmapped addresses map to `num_functions` which is the br_table default (halt).
+fn build_dispatch_table(module: &WasmModule) -> DispatchTable {
+    let n = module.functions.len() as u32;
+
+    if module.functions.is_empty() {
+        return DispatchTable {
+            min_addr: 0,
+            data: vec![],
+            num_functions: 0,
+        };
+    }
+
+    // Collect (block_addr, function_index) pairs and sort by address
+    let mut addr_to_idx: Vec<(u64, u32)> = module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| (f.block_addr, idx as u32))
+        .collect();
+    addr_to_idx.sort_by_key(|&(addr, _)| addr);
+
+    let min_addr = addr_to_idx.first().unwrap().0 as u32;
+    let max_addr = addr_to_idx.last().unwrap().0 as u32;
+
+    // Table size: one entry per 2-byte-aligned address in the range
+    let table_size = ((max_addr - min_addr) / 2 + 1) as usize;
+
+    // Initialize all entries to the default (invalid) index
+    let default_idx = if n < 255 { n as u8 } else { 255 };
+    let mut data = vec![default_idx; table_size];
+
+    // Fill in the known block addresses
+    for &(addr, idx) in &addr_to_idx {
+        let slot = ((addr as u32 - min_addr) / 2) as usize;
+        if slot < data.len() {
+            data[slot] = idx as u8;
+        }
+    }
+
+    DispatchTable {
+        min_addr,
+        data,
+        num_functions: n,
+    }
+}
 
 /// Build the final Wasm binary
 pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     let mut wasm = Module::new();
+
+    // Pre-compute the dispatch table so we can reference it during code generation
+    let dispatch_table = build_dispatch_table(module);
 
     // ==========================================================================
     // Type section
@@ -19,17 +90,13 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     let mut types = TypeSection::new();
 
     // Type 0: Block function (param $m i32) (result i32)
-    types.ty().function(vec![ValType::I32], vec![ValType::I32]);
+    types.function(vec![ValType::I32], vec![ValType::I32]);
 
     // Type 1: Dispatch function (param $m i32, $pc i32) (result i32)
-    types
-        .ty()
-        .function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+    types.function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
 
     // Type 2: Syscall handler (param $m i32, $pc i32) (result i32)
-    types
-        .ty()
-        .function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+    types.function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
 
     wasm.section(&types);
 
@@ -47,7 +114,6 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
             maximum: Some((module.memory_pages * 4) as u64),
             memory64: false,
             shared: false,
-            page_size_log2: None,
         },
     );
 
@@ -79,10 +145,8 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     // Table for block dispatch
     tables.table(TableType {
         element_type: wasm_encoder::RefType::FUNCREF,
-        table64: false,
-        minimum: module.functions.len() as u64,
-        maximum: Some(module.functions.len() as u64),
-        shared: false,
+        minimum: module.functions.len() as u32,
+        maximum: Some(module.functions.len() as u32),
     });
 
     wasm.section(&tables);
@@ -112,8 +176,8 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
     // ==========================================================================
     let mut codes = CodeSection::new();
 
-    // Dispatch function
-    let dispatch_func = build_dispatch_function(module);
+    // Dispatch function (uses br_table for O(1) block dispatch)
+    let dispatch_func = build_dispatch_function(module, &dispatch_table);
     codes.function(&dispatch_func);
 
     // Block functions
@@ -124,81 +188,162 @@ pub fn build(module: &WasmModule) -> Result<Vec<u8>> {
 
     wasm.section(&codes);
 
+    // ==========================================================================
+    // Data section (dispatch mapping table)
+    // ==========================================================================
+    if !dispatch_table.data.is_empty() {
+        let mut data_section = DataSection::new();
+        // Active data segment: initialize memory at DISPATCH_MAP_OFFSET
+        data_section.active(
+            0, // memory index
+            &ConstExpr::i32_const(DISPATCH_MAP_OFFSET as i32),
+            dispatch_table.data.iter().copied(),
+        );
+        wasm.section(&data_section);
+    }
+
     Ok(wasm.finish())
 }
 
-/// Build the main dispatch function
-fn build_dispatch_function(module: &WasmModule) -> Function {
-    let mut func = Function::new(vec![(1, ValType::I32)]); // 1 local for pc
+/// Build the main dispatch function using br_table for O(1) block dispatch.
+///
+/// The dispatch loop structure:
+/// ```text
+/// func $run (param $m i32) (param $start_pc i32) (result i32)
+///   local $pc i32
+///   $pc = $start_pc
+///   loop $dispatch
+///     if $pc == -1: return 0 (halt)
+///     if $pc & 0x80000000: $pc = syscall($m, $pc); continue
+///     ;; br_table dispatch:
+///     block $default
+///       block $case_{n-1}
+///         ...
+///           block $case_0
+///             index = memory[DISPATCH_MAP_OFFSET + ($pc - min_addr) / 2]
+///             br_table $case_0 $case_1 ... $case_{n-1} $default
+///           end
+///           $pc = call block_func_0($m)
+///           br $dispatch
+///         end
+///         $pc = call block_func_1($m)
+///         br $dispatch
+///       ...
+///     end
+///     return -1 (unknown PC)
+///   end
+/// ```
+fn build_dispatch_function(module: &WasmModule, table: &DispatchTable) -> Function {
+    let mut func = Function::new(vec![(1, ValType::I32)]); // 1 local: $pc (local 2)
+    let n = table.num_functions;
 
-    // (func $run (param $m i32) (param $start_pc i32) (result i32)
-    //   (local $pc i32)
-    //   (local.set $pc (local.get 1))  ;; $start_pc
-    //   (loop $dispatch
-    //     ;; Check for halt
-    //     (if (i32.eq (local.get $pc) (i32.const -1))
-    //       (then (return (i32.const 0))))
-    //
-    //     ;; Check for syscall (high bit set)
-    //     (if (i32.and (local.get $pc) (i32.const 0x80000000))
-    //       (then
-    //         (local.set $pc (call $syscall (local.get 0) (local.get $pc)))
-    //         (br $dispatch)))
-    //
-    //     ;; Dispatch to block function
-    //     (local.set $pc
-    //       (call_indirect (type 0)
-    //         (local.get 0)     ;; $m
-    //         (i32.div_u (local.get $pc) (i32.const 4))))  ;; block index
-    //     (br $dispatch)))
+    // Locals: param $m=0, param $start_pc=1, local $pc=2
 
-    // Initialize $pc from parameter
+    // Initialize $pc from $start_pc parameter
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::LocalSet(2));
 
-    // Loop
+    // --- Main dispatch loop ---
     func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
-    // Check for halt (-1)
+    // Check for halt: if ($pc == -1) return 0
     func.instruction(&Instruction::LocalGet(2));
     func.instruction(&Instruction::I32Const(-1));
     func.instruction(&Instruction::I32Eq);
     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     func.instruction(&Instruction::I32Const(0));
     func.instruction(&Instruction::Return);
-    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::End); // end if
 
-    // Check for syscall (high bit)
+    // Check for syscall: if ($pc & 0x80000000) { $pc = syscall($m, $pc); continue }
     func.instruction(&Instruction::LocalGet(2));
     func.instruction(&Instruction::I32Const(0x80000000u32 as i32));
     func.instruction(&Instruction::I32And);
     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
     func.instruction(&Instruction::LocalGet(0)); // $m
-    func.instruction(&Instruction::LocalGet(2)); // $pc with flags
-    func.instruction(&Instruction::Call(0)); // syscall handler (import index 0)
-    func.instruction(&Instruction::LocalSet(2));
-    func.instruction(&Instruction::Br(1)); // Continue loop
-    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::LocalGet(2)); // $pc (with syscall flag)
+    func.instruction(&Instruction::Call(0));      // call imported syscall handler
+    func.instruction(&Instruction::LocalSet(2));  // $pc = result
+    func.instruction(&Instruction::Br(1));        // br $dispatch (loop is depth 1)
+    func.instruction(&Instruction::End); // end if
 
-    // For simplicity, use a br_table for dispatch
-    // In a real implementation, we'd build a proper jump table
+    if n == 0 {
+        // No block functions - just halt
+        func.instruction(&Instruction::I32Const(-1));
+        func.instruction(&Instruction::Return);
+    } else {
+        // --- br_table dispatch ---
+        //
+        // Nesting (from innermost):
+        //   depth 0: $case_0
+        //   depth 1: $case_1
+        //   ...
+        //   depth n-1: $case_{n-1}
+        //   depth n: $default
+        //   depth n+1: $dispatch (loop)
+        //
+        // After $case_i ends, the case handler runs and branches to $dispatch.
+        // The br depth to reach $dispatch from case i's handler is (n - i).
 
-    // For now, linear search (will be slow but correct)
-    // Real implementation would use address -> function index mapping
-    func.instruction(&Instruction::LocalGet(0)); // $m
-    func.instruction(&Instruction::LocalGet(2)); // $pc
+        // Open the $default block
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
 
-    // Call block function based on PC
-    // This is a simplified version - real impl needs proper block lookup
-    func.instruction(&Instruction::Call(2)); // First block function
+        // Open N case blocks (innermost = $case_0)
+        for _ in 0..n {
+            func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        }
 
-    func.instruction(&Instruction::LocalSet(2));
-    func.instruction(&Instruction::Br(0)); // Continue loop
+        // --- Compute the br_table index from $pc ---
+        // index = i32.load8_u(DISPATCH_MAP_OFFSET + ($pc - min_addr) / 2)
+        func.instruction(&Instruction::LocalGet(2));                          // $pc
+        func.instruction(&Instruction::I32Const(table.min_addr as i32));      // min_addr
+        func.instruction(&Instruction::I32Sub);                               // $pc - min_addr
+        func.instruction(&Instruction::I32Const(1));
+        func.instruction(&Instruction::I32ShrU);                              // / 2 (half-word index)
+        func.instruction(&Instruction::I32Const(DISPATCH_MAP_OFFSET as i32)); // add map base
+        func.instruction(&Instruction::I32Add);
 
-    func.instruction(&Instruction::End); // End loop
+        // Load the function index from the mapping table
+        func.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
 
+        // br_table: labels[0]=$case_0 (depth 0), ..., labels[n-1]=$case_{n-1} (depth n-1)
+        //           default=$default (depth n)
+        let labels: Vec<u32> = (0..n).collect();
+        func.instruction(&Instruction::BrTable(
+            labels.as_slice().into(),
+            n, // default label = $default block
+        ));
+
+        // Close the innermost block ($case_0) and emit case handlers
+        for i in 0..n {
+            func.instruction(&Instruction::End); // end $case_i block
+
+            // Case i handler: $pc = call block_func_i($m)
+            // Block functions start at function index 2 (0=syscall import, 1=dispatch)
+            func.instruction(&Instruction::LocalGet(0));          // $m
+            func.instruction(&Instruction::Call(i + 2));           // call block_func_i
+            func.instruction(&Instruction::LocalSet(2));           // $pc = result
+            func.instruction(&Instruction::Br(n - i));             // br $dispatch loop
+        }
+
+        // Close the $default block
+        func.instruction(&Instruction::End); // end $default
+
+        // Default handler: unknown PC address, halt
+        func.instruction(&Instruction::I32Const(-1));
+        func.instruction(&Instruction::Return);
+    }
+
+    // Close the dispatch loop
+    func.instruction(&Instruction::End); // end loop
+
+    // Unreachable return (loop always exits via return)
     func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::End); // end function
 
     func
 }
