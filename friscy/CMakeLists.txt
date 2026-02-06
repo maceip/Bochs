@@ -90,50 +90,55 @@ else()
 endif()
 
 # --- Link flags ---
-set(FRISCY_LINK_FLAGS
-    -fexceptions
-    -sALLOW_TABLE_GROWTH
-    -sINITIAL_MEMORY=536870912      # 512MB initial (matches 29-bit arena)
-    -sALLOW_MEMORY_GROWTH
-    -sMAXIMUM_MEMORY=2147483648     # 2GB max
-    -sSTACK_SIZE=1048576            # 1MB stack
-    -sEXPORT_ES6=1
-    -sMODULARIZE=1
-    -sEXPORTED_RUNTIME_METHODS=['FS','callMain','HEAPU8']
-    -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
-)
+if(EMSCRIPTEN)
+    set(FRISCY_LINK_FLAGS
+        -fexceptions
+        -sALLOW_TABLE_GROWTH
+        -sINITIAL_MEMORY=536870912      # 512MB initial (matches 29-bit arena)
+        -sALLOW_MEMORY_GROWTH
+        -sMAXIMUM_MEMORY=2147483648     # 2GB max
+        -sSTACK_SIZE=1048576            # 1MB stack
+        -sEXPORT_ES6=1
+        -sMODULARIZE=1
+        -sEXPORTED_RUNTIME_METHODS=['FS','callMain','HEAPU8']
+        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free']
+    )
 
-if(FRISCY_PRODUCTION)
-    list(APPEND FRISCY_LINK_FLAGS
-        -O3
-        -flto
-        --closure=1                 # Minify JS glue
-        -sWASM_BIGINT               # Native i64 (faster)
-        -sENVIRONMENT=web,worker    # Strip Node.js code
-        -sSINGLE_FILE               # Embed Wasm in JS
+    if(FRISCY_PRODUCTION)
+        list(APPEND FRISCY_LINK_FLAGS
+            -O3
+            -flto
+            --closure=1                 # Minify JS glue
+            -sWASM_BIGINT               # Native i64 (faster)
+            -sENVIRONMENT=web,worker    # Strip Node.js code
+            -sSINGLE_FILE               # Embed Wasm in JS
+        )
+    else()
+        list(APPEND FRISCY_LINK_FLAGS
+            -O2
+            -sASSERTIONS=1
+        )
+    endif()
+
+    # Wizer support for instant snapshots
+    if(FRISCY_WIZER)
+        list(APPEND FRISCY_LINK_FLAGS
+            -sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_wizer_init']
+        )
+        target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
+    endif()
+
+    target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})
+
+    # Output file
+    set_target_properties(friscy PROPERTIES
+        OUTPUT_NAME "friscy"
+        SUFFIX ".js"
     )
 else()
-    list(APPEND FRISCY_LINK_FLAGS
-        -O2
-        -sASSERTIONS=1
-    )
+    # Native build
+    target_link_options(friscy PRIVATE -fexceptions)
 endif()
-
-# Wizer support for instant snapshots
-if(FRISCY_WIZER)
-    list(APPEND FRISCY_LINK_FLAGS
-        -sEXPORTED_FUNCTIONS=['_main','_malloc','_free','_wizer_init']
-    )
-    target_compile_definitions(friscy PRIVATE FRISCY_WIZER=1)
-endif()
-
-target_link_options(friscy PRIVATE ${FRISCY_LINK_FLAGS})
-
-# Output file
-set_target_properties(friscy PROPERTIES
-    OUTPUT_NAME "friscy"
-    SUFFIX ".js"
-)
 
 # --- Print configuration ---
 message(STATUS "friscy configuration:")

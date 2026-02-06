@@ -216,8 +216,7 @@ int main(int argc, char** argv) {
         machine.setup_native_memory(MEMORY_SYSCALLS_BASE);
 
         // Install our VFS-backed syscall handlers
-        syscalls::SyscallHandler syscall_handler(g_vfs);
-        syscall_handler.install(machine);
+        syscalls::install_syscalls(machine, g_vfs);
 
         // Set up environment variables
         std::vector<std::string> env = {
@@ -233,19 +232,9 @@ int main(int argc, char** argv) {
             guest_args.push_back(entry_path);
         }
 
-        // Convert to C-style arrays for libriscv
-        std::vector<const char*> c_args;
-        for (const auto& arg : guest_args) {
-            c_args.push_back(arg.c_str());
-        }
-
-        std::vector<const char*> c_env;
-        for (const auto& e : env) {
-            c_env.push_back(e.c_str());
-        }
-
         // Set up program arguments and environment
-        machine.setup_argv(c_args, c_env);
+        // libriscv expects std::vector<std::string>
+        machine.setup_argv(guest_args, env);
 
         // Route guest stdout/stderr to host
         machine.set_printer([](const auto&, const char* data, size_t len) {
