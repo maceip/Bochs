@@ -21,6 +21,14 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#else
+// Native: use real POSIX sockets
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #endif
 
 namespace net {
@@ -43,21 +51,28 @@ struct sockaddr_in6 {
     uint32_t sin6_scope_id;
 };
 
-// Socket types
-constexpr int SOCK_STREAM = 1;
-constexpr int SOCK_DGRAM  = 2;
-constexpr int SOCK_RAW    = 3;
+// Socket constants (in namespace to avoid macro clashes with system headers)
+namespace sock {
+    constexpr int STREAM = 1;
+    constexpr int DGRAM  = 2;
+    constexpr int RAW    = 3;
+}
 
-// Address families
-constexpr int AF_UNIX  = 1;
-constexpr int AF_INET  = 2;
-constexpr int AF_INET6 = 10;
+namespace af {
+    constexpr int UNIX  = 1;
+    constexpr int INET  = 2;
+    constexpr int INET6 = 10;
+}
 
-// Socket options
-constexpr int SOL_SOCKET = 1;
-constexpr int SO_REUSEADDR = 2;
-constexpr int SO_ERROR = 4;
-constexpr int SO_KEEPALIVE = 9;
+namespace sol {
+    constexpr int SOCKET = 1;
+}
+
+namespace so {
+    constexpr int REUSEADDR = 2;
+    constexpr int ERROR = 4;
+    constexpr int KEEPALIVE = 9;
+}
 
 // Error codes (negated for syscall return)
 namespace err {
@@ -96,12 +111,23 @@ struct VSocket {
     bool listening;
     bool nonblocking;
 
+#ifndef __EMSCRIPTEN__
+    int native_fd;           // Real socket fd for native builds
+#endif
+
     // For connected sockets
     std::vector<uint8_t> recv_buffer;
 
     // Callback for async operations (used in Wasm)
     std::function<void(int result)> on_connect;
     std::function<void(const uint8_t*, size_t)> on_recv;
+
+    VSocket() : fd(-1), domain(0), type(0), protocol(0),
+                connected(false), listening(false), nonblocking(false)
+#ifndef __EMSCRIPTEN__
+                , native_fd(-1)
+#endif
+    {}
 };
 
 // Network context - holds all virtual sockets
@@ -112,12 +138,20 @@ public:
     NetworkContext() : next_fd_(SOCKET_FD_BASE) {}
 
     int create_socket(int domain, int type, int protocol) {
-        if (domain != AF_INET && domain != AF_INET6) {
+        if (domain != af::INET && domain != af::INET6) {
             return err::AFNOSUPPORT;
         }
-        if (type != SOCK_STREAM && type != SOCK_DGRAM) {
+        if (type != sock::STREAM && type != sock::DGRAM) {
             return err::PROTOTYPE;
         }
+
+#ifndef __EMSCRIPTEN__
+        // Native: create a real socket
+        int native_fd = ::socket(domain, type, protocol);
+        if (native_fd < 0) {
+            return -errno;
+        }
+#endif
 
         int fd = next_fd_++;
         VSocket sock;
@@ -128,6 +162,10 @@ public:
         sock.connected = false;
         sock.listening = false;
         sock.nonblocking = false;
+
+#ifndef __EMSCRIPTEN__
+        sock.native_fd = native_fd;
+#endif
 
         sockets_[fd] = std::move(sock);
 
@@ -151,6 +189,11 @@ public:
 
 #ifdef __EMSCRIPTEN__
         notify_socket_closed(fd);
+#else
+        // Native: close real socket
+        if (it->second.native_fd >= 0) {
+            ::close(it->second.native_fd);
+        }
 #endif
 
         sockets_.erase(it);
@@ -338,8 +381,17 @@ inline void sys_connect(Machine& m) {
     }
     m.set_result(result);
 #else
-    // Native: not implemented (would use real sockets)
-    m.set_result(err::NOSYS);
+    // Native: use real connect
+    struct ::sockaddr_in native_addr;
+    memcpy(&native_addr, addr_data.data(), std::min(addrlen, (uint32_t)sizeof(native_addr)));
+
+    int result = ::connect(sock->native_fd, (struct sockaddr*)&native_addr, addrlen);
+    if (result == 0) {
+        sock->connected = true;
+        m.set_result(0);
+    } else {
+        m.set_result(-errno);
+    }
 #endif
 }
 
@@ -357,7 +409,7 @@ inline void sys_sendto(Machine& m) {
         return;
     }
 
-    if (sock->type == SOCK_STREAM && !sock->connected) {
+    if (sock->type == sock::STREAM && !sock->connected) {
         m.set_result(err::NOTCONN);
         return;
     }
@@ -377,7 +429,13 @@ inline void sys_sendto(Machine& m) {
 
     m.set_result(result >= 0 ? (int64_t)len : result);
 #else
-    m.set_result(err::NOSYS);
+    // Native: use real send
+    ssize_t result = ::send(sock->native_fd, data.data(), len, 0);
+    if (result >= 0) {
+        m.set_result(result);
+    } else {
+        m.set_result(-errno);
+    }
 #endif
 }
 
@@ -395,7 +453,7 @@ inline void sys_recvfrom(Machine& m) {
         return;
     }
 
-    if (sock->type == SOCK_STREAM && !sock->connected) {
+    if (sock->type == sock::STREAM && !sock->connected) {
         m.set_result(err::NOTCONN);
         return;
     }
@@ -419,7 +477,17 @@ inline void sys_recvfrom(Machine& m) {
         m.set_result(-11);
     }
 #else
-    m.set_result(err::NOSYS);
+    // Native: use real recv
+    std::vector<uint8_t> buf(len);
+    ssize_t result = ::recv(sock->native_fd, buf.data(), len, 0);
+    if (result > 0) {
+        m.memory.memcpy(buf_ptr, buf.data(), result);
+        m.set_result(result);
+    } else if (result == 0) {
+        m.set_result(0);  // Connection closed
+    } else {
+        m.set_result(-errno);
+    }
 #endif
 }
 
@@ -457,7 +525,7 @@ inline void sys_getsockopt(Machine& m) {
     }
 
     // Handle SO_ERROR specially
-    if (optname == SO_ERROR) {
+    if (optname == so::ERROR) {
         int32_t error = 0;
         m.memory.memcpy(optval_ptr, &error, sizeof(error));
         int32_t len = sizeof(error);
@@ -507,7 +575,7 @@ inline void sys_getsockname(Machine& m) {
     // Return a default address
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
+    addr.sin_family = af::INET;
     addr.sin_port = 0;
     addr.sin_addr = 0x0100007f;  // 127.0.0.1
 

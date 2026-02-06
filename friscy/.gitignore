@@ -8,3 +8,7 @@ src/
 # Go artifacts
 host_proxy/go.sum
 host_proxy/host_proxy
+
+# Test binaries
+tests/test_http
+tests/test_http_minimal
