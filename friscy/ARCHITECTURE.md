@@ -127,6 +127,91 @@ Full compatibility (~100 syscalls) adds:
 - Network: socket, connect, bind, listen, accept, recvfrom, sendto
 - Advanced: epoll, eventfd, pipe
 
+## Networking Architecture
+
+friscy provides network access to containers via a WebSocket bridge to a host-side
+proxy. This enables socket syscalls (TCP/UDP) without browser networking restrictions.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Browser                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                     friscy.wasm                                │  │
+│  │  ┌──────────────┐      ┌──────────────┐                       │  │
+│  │  │ RISC-V Guest │ ──── │ network.hpp  │                       │  │
+│  │  │ socket()     │      │ (syscalls)   │                       │  │
+│  │  └──────────────┘      └──────┬───────┘                       │  │
+│  └───────────────────────────────┼───────────────────────────────┘  │
+│                                  │ EM_ASM                            │
+│  ┌───────────────────────────────▼───────────────────────────────┐  │
+│  │                  network_bridge.js                             │  │
+│  │  • Translates socket calls to WebSocket messages               │  │
+│  │  • Buffers received data                                       │  │
+│  │  • Handles connect/send/recv                                   │  │
+│  └───────────────────────────────┬───────────────────────────────┘  │
+└──────────────────────────────────┼──────────────────────────────────┘
+                                   │ WebSocket
+                                   │ ws://localhost:8765
+┌──────────────────────────────────▼──────────────────────────────────┐
+│                          Host Machine                                │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                    host_proxy (Go)                             │  │
+│  │  • Accepts WebSocket connections                               │  │
+│  │  • Creates real TCP/UDP sockets                                │  │
+│  │  • Forwards data between browser and network                   │  │
+│  │  • Optional: gvisor-tap-vsock for advanced networking          │  │
+│  └───────────────────────────────┬───────────────────────────────┘  │
+│                                  │                                   │
+│                                  ▼                                   │
+│                         Real Network / Internet                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Supported Socket Syscalls
+
+| Syscall | Number | Status | Notes |
+|---------|--------|--------|-------|
+| socket | 198 | ✅ | AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM |
+| bind | 200 | ✅ | Via proxy |
+| listen | 201 | ✅ | Via proxy |
+| accept | 202 | ⚠️ | Async, limited |
+| connect | 203 | ✅ | Returns EINPROGRESS, async completion |
+| getsockname | 204 | ✅ | Returns localhost |
+| getpeername | 205 | ⚠️ | Stub |
+| sendto | 206 | ✅ | Via proxy |
+| recvfrom | 207 | ✅ | Buffered in JS |
+| setsockopt | 208 | ✅ | Most options ignored |
+| getsockopt | 209 | ✅ | SO_ERROR returns 0 |
+| shutdown | 210 | ✅ | Via proxy |
+
+### Running with Networking
+
+```bash
+# Terminal 1: Start host proxy
+cd host_proxy && go run main.go -listen :8765
+
+# Terminal 2: Run friscy in browser
+# The network_bridge.js will connect to ws://localhost:8765
+```
+
+### Advanced: gvisor-tap-vsock Integration
+
+For more advanced networking (HTTPS interception, custom routing), the host_proxy
+can be extended to use gvisor-tap-vsock's userspace network stack:
+
+```go
+import (
+    "github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
+    "github.com/containers/gvisor-tap-vsock/pkg/types"
+)
+```
+
+This enables:
+- Full TCP/IP stack in userspace
+- MITM HTTPS proxying with dynamic certs
+- Custom DNS resolution
+- NAT traversal
+
 ## File Structure
 
 ```
@@ -135,9 +220,14 @@ friscy/
 ├── main.cpp                # Host: libriscv + syscalls + VFS
 ├── vfs.hpp                 # Virtual filesystem implementation
 ├── syscalls.hpp            # Linux syscall handlers
+├── network.hpp             # Socket syscall handlers
+├── network_bridge.js       # JS WebSocket bridge for networking
+├── elf_loader.hpp          # Dynamic ELF loading support
 ├── container_to_riscv.sh   # Docker → RISC-V extraction
-├── pack_rootfs.py          # Convert rootfs.tar → embeddable
 ├── harness.sh              # Docker-based Wasm build
+├── host_proxy/             # Host-side network proxy
+│   ├── main.go             # WebSocket → real network bridge
+│   └── go.mod              # Go module dependencies
 ├── test_node.js            # Node.js test runner
-└── guest.cpp               # Example RISC-V guest (for testing)
+└── PERFORMANCE_ROADMAP.md  # Strategy to beat WebVM
 ```

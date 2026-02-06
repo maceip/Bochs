@@ -4,3 +4,7 @@ build-native/
 
 # Downloaded dependencies
 src/
+
+# Go artifacts
+host_proxy/go.sum
+host_proxy/host_proxy

@@ -14,6 +14,7 @@
 #include <libriscv/machine.hpp>
 #include "vfs.hpp"
 #include "syscalls.hpp"
+#include "network.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -217,6 +218,9 @@ int main(int argc, char** argv) {
 
         // Install our VFS-backed syscall handlers
         syscalls::install_syscalls(machine, g_vfs);
+
+        // Install network syscall handlers (socket, connect, etc.)
+        net::install_network_syscalls(machine);
 
         // Set up environment variables
         std::vector<std::string> env = {
