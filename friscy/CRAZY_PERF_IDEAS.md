@@ -60,7 +60,7 @@ fn translate_instruction(inst: RiscvInst) -> Vec<WasmInst> {
 
 ---
 
-### 2. Wasm Tail Calls (Available Now!)
+### 2. Wasm Tail Calls (BLOCKED - Browser Limitation)
 
 The interpreter's main loop:
 ```cpp
@@ -74,15 +74,23 @@ while (true) {
 }
 ```
 
-With tail calls, we can use **threaded dispatch**:
+With tail calls, we could use **threaded dispatch**:
 ```cpp
 // Each handler jumps directly to the next, no switch overhead
 [[musttail]] return handlers[next_opcode](machine);
 ```
 
-**Emscripten flag:** `-mtail-call`
+**STATUS: BLOCKED** ❌
 
-**Expected speedup: 20-40%** on interpreter
+Emscripten's `-mtail-call` flag doesn't work with 64-bit function tables
+(WASM_BIGINT). The browser's Wasm implementation can't handle tail calls
+with i64 table entries yet. This is a V8/SpiderMonkey limitation.
+
+**Workaround:** Use computed goto in C++ (which libriscv already does) -
+Emscripten compiles this to a switch + br_table, which is decent but not
+as fast as true tail calls.
+
+**Expected speedup: 0%** (blocked), would be 20-40% if it worked
 
 ---
 
@@ -107,6 +115,27 @@ for (int i = 0; i < len/16; i++) vdst[i] = vsrc[i];
 ---
 
 ### 4. Dynamic Wasm Module Generation (CheerpX-style)
+
+**Important clarification:** We're NOT JIT-compiling RISC-V to RISC-V.
+We're *translating* RISC-V to Wasm, then the browser JIT compiles Wasm to native.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    What "Hot JIT" means for friscy                    │
+│                                                                       │
+│   RISC-V binary        →  Our translator   →  Wasm bytecode          │
+│   (guest code)            (at runtime)        (generated)             │
+│                                                    ↓                  │
+│                                              Browser JIT              │
+│                                              (V8/SpiderMonkey)        │
+│                                                    ↓                  │
+│                                              Native x86/ARM           │
+│                                              (what actually runs)     │
+│                                                                       │
+│   The RISC-V guest never knows - it thinks it's being interpreted.   │
+│   But hot paths are actually running as native code via Wasm.        │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 The key insight from CheerpX/similar projects: **generate separate Wasm modules for hot code paths at runtime**.
 
